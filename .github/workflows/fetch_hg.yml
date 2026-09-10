@@ -58,21 +58,9 @@ jobs:
       - name: Generate WEBP for HymecNG
         run: python scripts/generate_webp.py
 
-      - name: Clean old runs on R2 except current
+      - name: Upload gewitter_latest.webp to R2
         run: |
-          for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/hymecng/ --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
-            if [ "$run_folder" != "${{ steps.set_run_date.outputs.run }}/" ]; then
-              aws s3 rm s3://${{ secrets.R2_BUCKET }}/hymecng/$run_folder --recursive --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-            fi
-          done
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-
-      - name: Upload current run to R2
-        run: |
-          aws s3 sync ./data/hymecng/ s3://${{ secrets.R2_BUCKET }}/hymecng/${{ steps.set_run_date.outputs.run }}/ \
-            --exclude "*-hd5" \
+          aws s3 cp ./data/hymecng/gewitter_latest.webp s3://${{ secrets.R2_BUCKET }}/hymecng/gewitter_latest.webp \
             --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
