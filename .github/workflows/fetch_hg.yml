@@ -1,0 +1,79 @@
+name: Fetch HymecNG File and Generate Webp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch_generate_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.AIGFS_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE (rounded to 5 min, UTC)
+        id: set_run_date
+        run: |
+          HOUR=$(date -u +%H)
+          MINUTE_RAW=$(date -u +%M)
+          MINUTE=$(( (10#$MINUTE_RAW / 5) * 5 ))
+          TIME=$(printf "%02d%02d" "$HOUR" "$MINUTE")
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%m)
+          DAY=$(date -u +%d)
+          DATE=$(date -u +%Y%m%d)
+
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
+
+      - name: Download HymecNG composite file from DWD Open Data
+        run: |
+          mkdir -p data/hymecng
+
+          FILENAME="composite_HymecNG_${DATE}_${TIME}_000-hd5"
+          URL="https://opendata.dwd.de/weather/radar/composite/hymecng/${FILENAME}"
+
+          echo "Lade: $URL"
+          curl -fSL "$URL" -o "data/hymecng/${FILENAME}"
+
+      - name: Generate WEBP for HymecNG
+        run: python scripts/generate_webp.py
+
+      - name: Clean old runs on R2 except current
+        run: |
+          for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/hymecng/ --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
+            if [ "$run_folder" != "${{ steps.set_run_date.outputs.run }}/" ]; then
+              aws s3 rm s3://${{ secrets.R2_BUCKET }}/hymecng/$run_folder --recursive --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            fi
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Upload current run to R2
+        run: |
+          aws s3 sync ./data/hymecng/ s3://${{ secrets.R2_BUCKET }}/hymecng/${{ steps.set_run_date.outputs.run }}/ \
+            --exclude "*-hd5" \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
