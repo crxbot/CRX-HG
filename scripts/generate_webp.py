@@ -338,9 +338,8 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    out_name = f"niederschlagsart_{ts:%Y%m%d}_{ts:%H%M}.webp"
-    out_path = src_dir / out_name
-    save_webp(rgba, out_path)
+        out_path = src_dir / "gewitter_latest.webp"
+        save_webp(rgba, out_path)
 
     if thunder_mask is not None:
         embed_thunderstorm_chunk(out_path, thunder_mask, thunder_extent)
