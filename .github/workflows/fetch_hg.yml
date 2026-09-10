@@ -3,9 +3,15 @@ name: Fetch HymecNG File and Generate Webp
 on:
   workflow_dispatch:
 
+concurrency:
+  # verhindert, dass zwei Laeufe gleichzeitig dieselbe Datei generieren/hochladen
+  group: fetch-hymecng
+  cancel-in-progress: false
+
 jobs:
   fetch_generate_deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # Sicherheitsnetz, falls die Datei nie erscheint
 
     steps:
       - name: Checkout Repo
@@ -45,23 +51,57 @@ jobs:
           echo "DATE=$DATE" >> $GITHUB_ENV
           echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
 
-      - name: Download HymecNG composite file from DWD Open Data
+      - name: Download HymecNG composite file from DWD Open Data (mit Retry)
         run: |
           mkdir -p data/hymecng
 
           FILENAME="composite_HymecNG_${DATE}_${TIME}_000-hd5"
           URL="https://opendata.dwd.de/weather/radar/composite/hymecng/${FILENAME}"
+          OUT="data/hymecng/${FILENAME}"
 
-          echo "Lade: $URL"
-          curl -fSL "$URL" -o "data/hymecng/${FILENAME}"
+          # Die Datei erscheint normalerweise ~1 Min nach dem 5-Minuten-Slot,
+          # in Ausnahmefaellen bis zu ~2 Min spaeter. Wir pollen alle 15s,
+          # bis zu 10 Versuche = max. 2,5 Minuten Wartezeit.
+          MAX_ATTEMPTS=10
+          SLEEP_SECONDS=15
+
+          echo "Warte auf: $URL"
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            HTTP_CODE=$(curl -s -o "$OUT" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 60 \
+              "$URL" || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ] && [ -s "$OUT" ]; then
+              echo "Datei erfolgreich geladen (Versuch $i/$MAX_ATTEMPTS, HTTP $HTTP_CODE)."
+              exit 0
+            fi
+
+            echo "Versuch $i/$MAX_ATTEMPTS: Datei noch nicht verfuegbar (HTTP $HTTP_CODE). Warte ${SLEEP_SECONDS}s..."
+            rm -f "$OUT"
+            sleep "$SLEEP_SECONDS"
+          done
+
+          echo "::error::Datei nach $MAX_ATTEMPTS Versuchen (~$(( MAX_ATTEMPTS * SLEEP_SECONDS / 60 )) Minuten) nicht verfuegbar - Abbruch."
+          exit 1
 
       - name: Generate WEBP for HymecNG
         run: python scripts/generate_webp.py
 
-      - name: Upload gewitter_latest.webp to R2
+      - name: Upload gewitter_latest.webp to R2 (mit Retry)
         run: |
-          aws s3 cp ./data/hymecng/gewitter_latest.webp s3://${{ secrets.R2_BUCKET }}/hymecng/gewitter_latest.webp \
-            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          MAX_ATTEMPTS=3
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if aws s3 cp ./data/hymecng/gewitter_latest.webp \
+                s3://${{ secrets.R2_BUCKET }}/hymecng/gewitter_latest.webp \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
+              echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              exit 0
+            fi
+            echo "Upload fehlgeschlagen (Versuch $i/$MAX_ATTEMPTS), warte 10s..."
+            sleep 10
+          done
+          echo "::error::Upload nach $MAX_ATTEMPTS Versuchen fehlgeschlagen."
+          exit 1
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
