@@ -39,7 +39,7 @@ LIGHTNING_WINDOW_MINUTES = 5  # nur Blitze der letzten 5 Minuten vor dem Radar-Z
 LIGHTNING_ARCHIVE_TZ = ZoneInfo("Europe/Berlin")
 
 
-LIGHTNING_MARKER_RADIUS_PX = 6
+LIGHTNING_MARKER_RADIUS_PX = 8
 
 
 GEWITTER_FOURCC = b"GWTR"
