@@ -21,7 +21,7 @@ from pyproj import Transformer
 FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
 
 
-PRECIP_CLASSES = {2, 3, 5, 6, 7}
+PRECIP_CLASSES = {2, 3, 4, 5, 6, 7, 8}
 
 
 THUNDER_DATA_CLASSES = PRECIP_CLASSES | {9, 10}
