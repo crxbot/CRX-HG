@@ -15,17 +15,17 @@ jobs:
 
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           token: ${{ secrets.HG_PAT }}
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Cache Python packages
-        uses: actions/cache@v3
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -41,12 +41,12 @@ jobs:
           HOUR=$(date -u +%H)
           MINUTE_RAW=$(date -u +%M)
           MINUTE=$(( (10#$MINUTE_RAW / 5) * 5 ))
-          TIME=$(printf "%s%02d" "$HOUR" "$MINUTE")
+          TIME=$(printf "%02d%02d" "$HOUR" "$MINUTE")
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
           DAY=$(date -u +%d)
           DATE=$(date -u +%Y%m%d)
-          
+
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
           echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
@@ -62,8 +62,8 @@ jobs:
           # Die Datei erscheint normalerweise ~1 Min nach dem 5-Minuten-Slot,
           # in Ausnahmefaellen bis zu ~2 Min spaeter. Wir pollen alle 15s,
           # bis zu 10 Versuche = max. 2,5 Minuten Wartezeit.
-          MAX_ATTEMPTS=50
-          SLEEP_SECONDS=5
+          MAX_ATTEMPTS=10
+          SLEEP_SECONDS=15
 
           echo "Warte auf: $URL"
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
