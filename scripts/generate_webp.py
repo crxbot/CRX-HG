@@ -12,6 +12,7 @@ import numpy as np
 import requests
 from PIL import Image
 from pyproj import Transformer
+from scipy import ndimage
 
 # --------------------------------------------------------------------------
 # Konfiguration
@@ -200,6 +201,7 @@ def apply_thunderstorm_overlay(
     radius = LIGHTNING_MARKER_RADIUS_PX
 
     combined_mask = np.isin(class_array, list(THUNDER_DATA_CLASSES))
+    combined_mask = ndimage.binary_closing(combined_mask, structure=np.ones((3, 3)))
     thunder_mask = np.zeros((ysize, xsize), dtype=bool)
 
 
@@ -214,7 +216,7 @@ def apply_thunderstorm_overlay(
         if pixel is None:
             continue
         row, col = pixel
-        if class_array[row, col] not in THUNDER_DATA_CLASSES:
+        if not combined_mask[row, col]:
             continue
 
         row_start = max(0, row - radius)
