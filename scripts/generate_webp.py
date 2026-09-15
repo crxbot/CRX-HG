@@ -111,9 +111,9 @@ def _parse_iso_to_ms(iso_str: str) -> int:
 
 def fetch_recent_strikes_backup(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
     """Fallback-Quelle, falls der primaere Archiv-Feed (noch) kein 404-freies
-    JSON fuer den angefragten Zeitstempel liefert. Liefert die letzten
-    ~60 Minuten in 5-Minuten-Buckets relativ zum Abrufzeitpunkt - wir filtern
-    daraus das gewuenschte Fenster [ts - minutes, ts]."""
+    JSON fuer den angefragten Zeitstempel liefert. Die Backup-API liefert ein
+    flaches 'strikes'-Array mit lat/lon/time - wir filtern daraus das
+    gewuenschte Fenster [ts - minutes, ts]."""
     resp = requests.get(LIGHTNING_BACKUP_URL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -123,11 +123,10 @@ def fetch_recent_strikes_backup(ts: datetime, minutes: int = LIGHTNING_WINDOW_MI
     start_ms = end_ms - minutes * 60 * 1000
 
     strikes = []
-    for bucket_strikes in data.get("buckets", {}).values():
-        for s in bucket_strikes:
-            t_ms = _parse_iso_to_ms(s["time"])
-            if start_ms <= t_ms <= end_ms:
-                strikes.append((s["lat"], s["lon"]))
+    for s in data.get("strikes", []):
+        t_ms = _parse_iso_to_ms(s["time"])
+        if start_ms <= t_ms <= end_ms:
+            strikes.append((s["lat"], s["lon"]))
     return strikes
 
 
