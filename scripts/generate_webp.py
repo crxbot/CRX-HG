@@ -33,6 +33,7 @@ THUNDER_DATA_CLASSES = PRECIP_CLASSES | {9, 10}
 THUNDER_COLOR_HEX = "#FD5FFF"
 
 LIGHTNING_BASE_URL = "https://radar.wetterstation-neustadt.de/blitze/archive/"
+LIGHTNING_BACKUP_URL = "https://nowsky.vercel.app/api/lightning"
 LIGHTNING_WINDOW_MINUTES = 5  # nur Blitze der letzten 5 Minuten vor dem Radar-Zeitstempel
 
 
@@ -103,11 +104,49 @@ def lightning_url_for_timestamp(ts: datetime) -> str:
     return f"{LIGHTNING_BASE_URL}{ts_local:%Y-%m-%d-%H%M}.json"
 
 
+def _parse_iso_to_ms(iso_str: str) -> int:
+    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
+
+
+def fetch_recent_strikes_backup(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
+    """Fallback-Quelle, falls der primaere Archiv-Feed (noch) kein 404-freies
+    JSON fuer den angefragten Zeitstempel liefert. Liefert die letzten
+    ~60 Minuten in 5-Minuten-Buckets relativ zum Abrufzeitpunkt - wir filtern
+    daraus das gewuenschte Fenster [ts - minutes, ts]."""
+    resp = requests.get(LIGHTNING_BACKUP_URL, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    ts_utc = ts.replace(tzinfo=timezone.utc)
+    end_ms = int(ts_utc.timestamp() * 1000)
+    start_ms = end_ms - minutes * 60 * 1000
+
+    strikes = []
+    for bucket_strikes in data.get("buckets", {}).values():
+        for s in bucket_strikes:
+            t_ms = _parse_iso_to_ms(s["time"])
+            if start_ms <= t_ms <= end_ms:
+                strikes.append((s["lat"], s["lon"]))
+    return strikes
+
+
 def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
 
     url = lightning_url_for_timestamp(ts)
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            print(
+                f"Warnung: Primaerer Blitz-Feed liefert 404 ({url}). "
+                "Weiche auf Backup-API aus.",
+                file=sys.stderr,
+            )
+            return fetch_recent_strikes_backup(ts, minutes=minutes)
+        raise
+
     data = resp.json()
 
     ts_utc = ts.replace(tzinfo=timezone.utc)
