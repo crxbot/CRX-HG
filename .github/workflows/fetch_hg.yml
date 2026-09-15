@@ -61,9 +61,9 @@ jobs:
 
           # Die Datei erscheint normalerweise ~1 Min nach dem 5-Minuten-Slot,
           # in Ausnahmefaellen bis zu ~2 Min spaeter. Wir pollen alle 15s,
-          # bis zu 10 Versuche = max. 2,5 Minuten Wartezeit.
-          MAX_ATTEMPTS=10
-          SLEEP_SECONDS=15
+          # bis zu 50 Versuche = max. 4 Minuten Wartezeit.
+          MAX_ATTEMPTS=50
+          SLEEP_SECONDS=5
 
           echo "Warte auf: $URL"
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
