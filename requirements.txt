@@ -1,6 +1,6 @@
-h5py
-numpy
-requests
-Pillow
-pyproj
-scipy
+h5py==3.16.0
+numpy==2.5.3
+pillow==12.3.0
+pyproj==3.8.0
+requests==2.34.2
+scipy==1.18.1
