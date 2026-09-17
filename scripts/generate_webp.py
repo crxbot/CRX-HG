@@ -306,7 +306,7 @@ def embed_thunderstorm_chunk(
     size = len(payload)
     chunk = GEWITTER_FOURCC + struct.pack("<I", size) + payload
     if size % 2 == 1:
-        chunk += b"\x00"  # RIFF-Padding auf gerade Laenge, zaehlt nicht zu size
+        chunk += b"\x00" 
 
     with open(webp_path, "rb") as f:
         content = f.read()
