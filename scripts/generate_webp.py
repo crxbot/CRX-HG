@@ -12,6 +12,7 @@ import numpy as np
 import requests
 from PIL import Image
 from pyproj import Transformer
+from scipy.signal import fftconvolve
 
 # --------------------------------------------------------------------------
 # Konfiguration
@@ -25,6 +26,12 @@ PRECIP_CLASSES = {2, 3, 4, 5, 6, 7, 8}
 
 
 THUNDER_DATA_CLASSES = PRECIP_CLASSES | {9, 10}
+
+# Code 1 Nearest
+FILL_UNCLASSIFIABLE_CODE = 1
+FILL_RADIUS_PX = 8          # Suchradius um jeden Code-1-Pixel
+FILL_MIN_NEIGHBORS = 4      # mind. so viele Niederschlags-Pixel im Radius, sonst bleibt 1
+PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]   # nur echte Niederschlagsklassen
 
 # --------------------------------------------------------------------------
 # Gewitter-/Blitz-Overlay (Klasse 11, kommt NICHT aus der HD5-Datei)
@@ -95,6 +102,48 @@ def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
 
     # Fallback: ersten gefundenen 2D-Datensatz verwenden
     return candidates[0]
+
+
+def fill_unclassifiable(
+    class_array: np.ndarray,
+    code: int = FILL_UNCLASSIFIABLE_CODE,
+    radius: int = FILL_RADIUS_PX,
+    min_neighbors: int = FILL_MIN_NEIGHBORS,
+) -> np.ndarray:
+    """Ersetzt 'code' durch den haeufigsten Niederschlagscode im Kreis um den Pixel.
+
+    Pixel mit dem Code 'code' (nicht klassifizierbar) werden dem am haeufigsten
+    vorkommenden Niederschlagscode in ihrer Kreisumgebung zugewiesen, sofern
+    mindestens 'min_neighbors' Niederschlags-Pixel im Radius liegen. Sonst
+    bleibt der Pixel unveraendert."""
+    bad = class_array == code
+    if not bad.any():
+        return class_array
+
+    # Kreis-Kernel
+    off = np.arange(-radius, radius + 1)
+    dr, dc = np.meshgrid(off, off, indexing="ij")
+    kernel = (dr * dr + dc * dc <= radius * radius).astype(np.float32)
+
+    # Pro Code zaehlen, wie oft er im Kreis vorkommt
+    codes = [c for c in PRECIP_SOURCE_CODES if (class_array == c).any()]
+    if not codes:
+        return class_array
+
+    counts = np.stack([
+        fftconvolve((class_array == c).astype(np.float32), kernel, mode="same")
+        for c in codes
+    ])                                   # Form: (n_codes, H, W)
+    counts = np.rint(counts)             # FFT-Rundungsrauschen entfernen
+
+    best_idx = counts.argmax(axis=0)
+    best_cnt = counts.max(axis=0)
+    best_code = np.asarray(codes)[best_idx]
+
+    fill = bad & (best_cnt >= min_neighbors)
+    out = class_array.copy()
+    out[fill] = best_code[fill]
+    return out
 
 
 def lightning_url_for_timestamp(ts: datetime) -> str:
@@ -214,9 +263,9 @@ def build_pixel_mapper(grid_info: dict):
 
     def latlon_to_pixel(lat: float, lon: float):
         x, y = transformer.transform(lon, lat)
-        col = int((x - ll_x) / xscale)
+        col = int(round((x - ll_x) / xscale))
         # Zeile 0 liegt (ODIM-Konvention) am Nordrand (UR), daher von oben zaehlen
-        row = ysize - 1 - int((y - ll_y) / yscale)
+        row = ysize - 1 - int(round((y - ll_y) / yscale))
         if 0 <= row < ysize and 0 <= col < xsize:
             return row, col
         return None
@@ -352,6 +401,9 @@ def main() -> None:
         class_array = ds[()]
         where_grp = find_where_group(f)
         grid_info = extract_grid_info(where_grp) if where_grp is not None else None
+
+    # Nicht klassifizierbare Pixel (Code 1) dem naechstliegenden Niederschlagscode zuweisen
+    class_array = fill_unclassifiable(class_array)
 
     height, width = class_array.shape
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
