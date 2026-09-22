@@ -8,6 +8,8 @@ updates:
       actions:
         patterns:
           - "*"
+    commit-message:
+      prefix: "fix"
 
   - package-ecosystem: "pip"
     directory: "/"
@@ -17,3 +19,5 @@ updates:
       python-deps:
         patterns:
           - "*"
+    commit-message:
+      prefix: "fix"
