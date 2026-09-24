@@ -41,15 +41,12 @@ jobs:
           HOUR=$(date -u +%H)
           MINUTE_RAW=$(date -u +%M)
           MINUTE=$(( (10#$MINUTE_RAW / 5) * 5 ))
-          TIME=$(printf "%02d%02d" "$HOUR" "$MINUTE")
-          YEAR=$(date -u +%Y)
-          MONTH=$(date -u +%m)
-          DAY=$(date -u +%d)
+          TIME=$(printf "%02d%02d" "$((10#$HOUR))" "$MINUTE")
           DATE=$(date -u +%Y%m%d)
 
-          echo "TIME=$TIME" >> $GITHUB_ENV
-          echo "DATE=$DATE" >> $GITHUB_ENV
-          echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
+          echo "TIME=$TIME" >> "$GITHUB_ENV"
+          echo "DATE=$DATE" >> "$GITHUB_ENV"
+          echo "run=${DATE}_${TIME}" >> "$GITHUB_OUTPUT"
 
       - name: Download HymecNG composite file from DWD Open Data (mit Retry)
         run: |
