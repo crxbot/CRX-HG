@@ -2,7 +2,7 @@ name: Cleanup Old Workflow Runs
 
 on:
   workflow_run:
-    workflows: ["Fetch HymecNG File and Generate Webp"] # oder "*" für alle Workflows
+    workflows: ["Fetch Gewitter File and Generate Webp"] # oder "*" für alle Workflows
     types:
       - completed  # Löst aus, sobald ein Run fertig ist
 permissions: 
