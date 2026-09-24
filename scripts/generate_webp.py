@@ -43,7 +43,8 @@ RV_DEFAULT_UNDETECT = 0.0
 # Umkreise um Blitztreffer werden eingefaerbt (siehe apply_thunderstorm_overlay).
 PRECIP_VISIBLE_THRESHOLD_MM = 0.01
 
-# Fuellen von nodata-Luecken: Umkreis-Mittelwert aus validen Nachbarpixeln
+# Fuellen von nodata-Luecken (auf dem NATIVEN Raster, vor dem Warp):
+# Umkreis-Mittelwert aus validen Nachbarpixeln
 FILL_RADIUS_PX = 8
 FILL_MIN_VALID_NEIGHBORS = 4
 
@@ -59,9 +60,20 @@ LIGHTNING_WINDOW_MINUTES = 5  # nur Blitze der letzten 5 Minuten vor dem Radar-Z
 
 LIGHTNING_ARCHIVE_TZ = ZoneInfo("Europe/Berlin")
 
+# Radius in Pixeln AUF DEM WEBMERCATOR-ZIELRASTER (siehe WEBMERCATOR_OUT_WIDTH).
+# Identisch zu Dokument 1, damit beide Overlays bei vergleichbarem
+# Kartenausschnitt visuell gleich groß erscheinen.
 LIGHTNING_MARKER_RADIUS_PX = 8
 
 GEWITTER_FOURCC = b"GWTR"
+
+# --------------------------------------------------------------------------
+# Geometrie / Ausgabe (identisch zu Dokument 1, fuer gemeinsames Zielraster)
+# --------------------------------------------------------------------------
+WEBMERCATOR_OUT_WIDTH = 1927
+EDGE_SAMPLES = 200
+BBOX_MARGIN_DEG = 0.02
+EARTH_RADIUS = 6378137.0
 
 
 # --------------------------------------------------------------------------
@@ -147,37 +159,6 @@ def read_precip_mm(ds: h5py.Dataset) -> np.ndarray:
     precip[negative_valid] = 0.0
 
     return precip
-
-
-def fill_nodata(
-    precip: np.ndarray,
-    radius: int = FILL_RADIUS_PX,
-    min_valid: int = FILL_MIN_VALID_NEIGHBORS,
-) -> np.ndarray:
-    """Ersetzt NaN-Pixel (nodata) durch den Umkreis-Mittelwert der validen
-    Nachbarwerte, sofern mindestens 'min_valid' valide Pixel im Radius
-    liegen. Sonst bleibt der Pixel NaN (= transparent)."""
-    nan_mask = np.isnan(precip)
-    if not nan_mask.any():
-        return precip
-
-    valid = ~nan_mask
-
-    off = np.arange(-radius, radius + 1)
-    dr, dc = np.meshgrid(off, off, indexing="ij")
-    kernel = (dr * dr + dc * dc <= radius * radius).astype(np.float32)
-
-    valid_f = valid.astype(np.float32)
-    values_f = np.where(valid, precip, 0.0).astype(np.float32)
-
-    count = np.rint(fftconvolve(valid_f, kernel, mode="same"))
-    total = fftconvolve(values_f, kernel, mode="same")
-    mean = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
-
-    fill_mask = nan_mask & (count >= min_valid)
-    out = precip.copy()
-    out[fill_mask] = mean[fill_mask]
-    return out
 
 
 def lightning_url_for_timestamp(ts: datetime) -> str:
@@ -278,66 +259,128 @@ def extract_grid_info(where_grp: h5py.Group) -> dict:
     }
 
 
-def build_pixel_mapper(grid_info: dict):
-    projdef = grid_info["projdef"]
-    xsize = grid_info["xsize"]
-    ysize = grid_info["ysize"]
-    xscale = grid_info["xscale"]
-    yscale = grid_info["yscale"]
-    ll_lon = grid_info["ll_lon"]
-    ll_lat = grid_info["ll_lat"]
-
-    transformer = Transformer.from_crs("EPSG:4326", projdef, always_xy=True)
-    ll_x, ll_y = transformer.transform(ll_lon, ll_lat)
-
-    def latlon_to_pixel(lat: float, lon: float):
-        x, y = transformer.transform(lon, lat)
-        col = int(round((x - ll_x) / xscale))
-        # Zeile 0 liegt (ODIM-Konvention) am Nordrand (UR), daher von oben zaehlen
-        row = ysize - 1 - int(round((y - ll_y) / yscale))
-        if 0 <= row < ysize and 0 <= col < xsize:
-            return row, col
-        return None
-
-    return latlon_to_pixel
+# --------------------------------------------------------------------------
+# Geometrie / Warp auf EPSG:3857 (uebernommen aus Dokument 1, fuer ein
+# gemeinsames Zielraster beider Skripte)
+# --------------------------------------------------------------------------
+def lonlat_to_webmercator(lon_deg, lat_deg):
+    x = EARTH_RADIUS * np.radians(lon_deg)
+    y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
+    return x, y
 
 
+def webmercator_to_lonlat(x, y):
+    lon = np.degrees(x / EARTH_RADIUS)
+    lat = np.degrees(2 * np.arctan(np.exp(y / EARTH_RADIUS)) - np.pi / 2)
+    return lon, lat
+
+
+def native_origin_and_extent(grid: dict, to_proj: Transformer):
+    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
+    x_max = ll_x + grid["xsize"] * grid["xscale"]
+    y_max = ll_y + grid["ysize"] * grid["yscale"]
+    return ll_x, ll_y, x_max, y_max
+
+
+def wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84: Transformer):
+    """WGS84-Bounding-Box durch Abtasten des nativen Rasterrands."""
+    t = np.linspace(0.0, 1.0, EDGE_SAMPLES)
+    xs_span = ll_x + t * (x_max - ll_x)
+    ys_span = ll_y + t * (y_max - ll_y)
+    xs = np.concatenate([xs_span, xs_span, np.full_like(ys_span, ll_x), np.full_like(ys_span, x_max)])
+    ys = np.concatenate([np.full_like(xs_span, ll_y), np.full_like(xs_span, y_max), ys_span, ys_span])
+    lons, lats = (np.asarray(a) for a in to_wgs84.transform(xs, ys))
+    return (
+        float(lons.min()) - BBOX_MARGIN_DEG,
+        float(lons.max()) + BBOX_MARGIN_DEG,
+        float(lats.min()) - BBOX_MARGIN_DEG,
+        float(lats.max()) + BBOX_MARGIN_DEG,
+    )
+
+
+def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
+    x_min, y_min = lonlat_to_webmercator(lon_min, lat_min)
+    x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
+    aspect = (y_max - y_min) / (x_max - x_min)
+    out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
+    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
+    y_new = np.linspace(y_min, y_max, out_h)
+    return x_new, y_new, [x_min, y_min, x_max, y_max]
+
+
+def nearest_neighbor_warp(
+    data: np.ndarray,
+    grid: dict,
+    to_proj: Transformer,
+    x_new: np.ndarray,
+    y_new: np.ndarray,
+    fill_value: float,
+) -> np.ndarray:
+    """Nearest-Neighbor-Warp eines nativen Rasters auf EPSG:3857."""
+    xx, yy = np.meshgrid(x_new, y_new)
+    lon, lat = webmercator_to_lonlat(xx, yy)
+    x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
+    x_nat = np.asarray(x_nat).reshape(xx.shape)
+    y_nat = np.asarray(y_nat).reshape(xx.shape)
+
+    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
+
+    col = np.round((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
+    row = np.round(grid["ysize"] - 1 - (y_nat - ll_y) / grid["yscale"]).astype(np.int64)
+    valid = (col >= 0) & (col < grid["xsize"]) & (row >= 0) & (row < grid["ysize"])
+
+    out = np.full(xx.shape, fill_value, dtype=np.float64)
+    out[valid] = data[row[valid], col[valid]]
+    return out
+
+
+# --------------------------------------------------------------------------
+# Gewitter-/Blitz-Overlay auf dem Webmercator-Zielraster
+# --------------------------------------------------------------------------
 def apply_thunderstorm_overlay(
-    rgba: np.ndarray, precip: np.ndarray, ts: datetime, grid_info: dict
+    rgba: np.ndarray,
+    precip_merc: np.ndarray,
+    ts: datetime,
+    x_new: np.ndarray,
+    y_new: np.ndarray,
 ) -> tuple[int, np.ndarray]:
     """Faerbt Pixel mit Blitztreffer UND messbarem Niederschlag
-    (>= PRECIP_VISIBLE_THRESHOLD_MM) als Gewitter (Klasse 11) ein."""
+    (>= PRECIP_VISIBLE_THRESHOLD_MM) als Gewitter (Klasse 11) ein.
+    Arbeitet auf dem bereits gewarpten Webmercator-Raster."""
 
-    mapper = build_pixel_mapper(grid_info)
     strikes = fetch_recent_strikes(ts, minutes=LIGHTNING_WINDOW_MINUTES)
     print(f"{len(strikes)} Blitze in den letzten {LIGHTNING_WINDOW_MINUTES} Minuten geladen.")
 
-    ysize, xsize = precip.shape
+    out_h, out_w = precip_merc.shape
     r, g, b = hex_to_rgb(THUNDER_COLOR_HEX)
     radius = LIGHTNING_MARKER_RADIUS_PX
 
-    safe_precip = np.nan_to_num(precip, nan=-1.0)
+    safe_precip = np.nan_to_num(precip_merc, nan=-1.0)
     combined_mask = safe_precip >= PRECIP_VISIBLE_THRESHOLD_MM
-    thunder_mask = np.zeros((ysize, xsize), dtype=bool)
+    thunder_mask = np.zeros((out_h, out_w), dtype=bool)
 
     offsets = np.arange(-radius, radius + 1)
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
     circle_mask_full = (dr * dr + dc * dc) <= radius * radius
 
+    x_min, x_max = x_new[0], x_new[-1]
+    y_min, y_max = y_new[0], y_new[-1]
+
     hit_count = 0
 
     for lat, lon in strikes:
-        pixel = mapper(lat, lon)
-        if pixel is None:
+        sx, sy = lonlat_to_webmercator(lon, lat)
+        if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
             continue
-        row, col = pixel
+        col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
+        row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
         if safe_precip[row, col] < PRECIP_VISIBLE_THRESHOLD_MM:
             continue
 
         row_start = max(0, row - radius)
-        row_end = min(ysize, row + radius + 1)
+        row_end = min(out_h, row + radius + 1)
         col_start = max(0, col - radius)
-        col_end = min(xsize, col + radius + 1)
+        col_end = min(out_w, col + radius + 1)
 
         mask_row_start = row_start - (row - radius)
         mask_row_end = mask_row_start + (row_end - row_start)
@@ -355,14 +398,6 @@ def apply_thunderstorm_overlay(
         hit_count += 1
 
     return hit_count, thunder_mask
-
-
-def compute_projection_extent(grid_info: dict) -> list[float]:
-    transformer = Transformer.from_crs("EPSG:4326", grid_info["projdef"], always_xy=True)
-    ll_x, ll_y = transformer.transform(grid_info["ll_lon"], grid_info["ll_lat"])
-    x_max = ll_x + grid_info["xsize"] * grid_info["xscale"]
-    y_max = ll_y + grid_info["ysize"] * grid_info["yscale"]
-    return [ll_x, ll_y, x_max, y_max]
 
 
 def embed_thunderstorm_chunk(
@@ -429,45 +464,52 @@ def main() -> None:
         where_grp = find_where_group(f)
         grid_info = extract_grid_info(where_grp) if where_grp is not None else None
 
-    # Fehlende Messungen (nodata) aus der Nachbarschaft auffuellen, damit
-    # Blitze am Rand von Messluecken den Niederschlag in der Naehe trotzdem
-    # erkennen
-    precip = fill_nodata(precip)
+    if grid_info is None:
+        sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht moeglich.")
 
-    height, width = precip.shape
+    # Fehlende Messungen (nodata) aus der Nachbarschaft auffuellen (auf dem
+    # nativen Raster), damit Blitze am Rand von Messluecken den
+    # Niederschlag in der Naehe trotzdem erkennen
+
+    to_proj = Transformer.from_crs("EPSG:4326", grid_info["projdef"], always_xy=True)
+    to_wgs84 = Transformer.from_crs(grid_info["projdef"], "EPSG:4326", always_xy=True)
+
+    ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid_info, to_proj)
+    lon_min, lon_max, lat_min, lat_max = wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84)
+    x_new, y_new, extent = webmercator_target_grid(lon_min, lon_max, lat_min, lat_max)
+    print(f"WGS84-BBox: lon [{lon_min:.4f}, {lon_max:.4f}], lat [{lat_min:.4f}, {lat_max:.4f}]")
+    print(f"EPSG:3857-Extent [xmin, ymin, xmax, ymax]: {extent}")
+    print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
+
+    # Niederschlag unabhaengig auf das gemeinsame Webmercator-Zielraster warpen
+    precip_merc = nearest_neighbor_warp(precip, grid_info, to_proj, x_new, y_new, fill_value=np.nan)
+
+    out_h, out_w = len(y_new), len(x_new)
     # Vollstaendig transparentes Bild - es wird NUR der Gewitter-/Blitz-
     # Umkreis eingefaerbt, keine eigene Niederschlagskarte gerendert.
-    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
 
     thunder_mask = None
-    thunder_extent = None
-    if grid_info is None:
+    try:
+        hits, thunder_mask = apply_thunderstorm_overlay(rgba, precip_merc, ts, x_new, y_new)
+        print(f"{hits} Blitz-Treffer als Gewitter (Klasse 11, {THUNDER_COLOR_HEX}) eingefaerbt.")
+    except requests.RequestException as e:
         print(
-            "Warnung: Keine 'where'-Projektionsinfo in der HD5-Datei gefunden "
-            "- Gewitter/Blitz-Overlay wird uebersprungen.",
+            f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). "
+            "Ueberspringe Gewitter-Overlay.",
             file=sys.stderr,
         )
-    else:
-        try:
-            hits, thunder_mask = apply_thunderstorm_overlay(rgba, precip, ts, grid_info)
-            thunder_extent = compute_projection_extent(grid_info)
-            print(f"{hits} Blitz-Treffer als Gewitter (Klasse 11, {THUNDER_COLOR_HEX}) eingefaerbt.")
-        except requests.RequestException as e:
-            print(
-                f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). "
-                "Ueberspringe Gewitter-Overlay.",
-                file=sys.stderr,
-            )
+        thunder_mask = np.zeros((out_h, out_w), dtype=bool)
 
-        out_path = SRC_DIR / OUT_FILENAME
-        save_webp(rgba, out_path)
+    out_path = SRC_DIR / OUT_FILENAME
+    # Zeilen umdrehen: y_new laeuft von Sued nach Nord, Bilder von oben nach unten
+    save_webp(rgba[::-1], out_path)
 
-    if thunder_mask is not None:
-        embed_thunderstorm_chunk(out_path, thunder_mask, thunder_extent)
-        print(
-            f"Gewitter-Datenchunk ({GEWITTER_FOURCC.decode()}) eingebettet: "
-            f"{int(thunder_mask.sum())} Pixel als Gewitter markiert."
-        )
+    embed_thunderstorm_chunk(out_path, thunder_mask[::-1], extent)
+    print(
+        f"Gewitter-Datenchunk ({GEWITTER_FOURCC.decode()}) eingebettet: "
+        f"{int(thunder_mask.sum())} Pixel als Gewitter markiert."
+    )
 
     print(f"Gespeichert: {out_path}")
 
