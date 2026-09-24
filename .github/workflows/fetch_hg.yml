@@ -1,4 +1,4 @@
-name: Fetch GEwitter File and Generate Webp
+name: Fetch Gewitter File and Generate Webp
 
 on:
   workflow_dispatch:
