@@ -18,20 +18,34 @@ from scipy.signal import fftconvolve
 # Konfiguration
 # --------------------------------------------------------------------------
 
-# Dateinamensschema laut DWD: composite_HymecNG_yyyymmdd_HHMM_000-hd5
-FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
+# Dateinamensschema laut DWD: composite_rv_yyyymmdd_HHMM_000-hd5
+FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
 
+SRC_DIR = Path("data/rv")
+OUT_FILENAME = "gewitter_latest.webp"
 
-PRECIP_CLASSES = {2, 3, 4, 5, 6, 7, 8}
+# --------------------------------------------------------------------------
+# RV-Composite: quantitatives Produkt (quantity=ACRR, mm pro 5 Minuten)
+# --------------------------------------------------------------------------
 
+RV_QUANTITY_KEYWORDS = ("ACRR", "RATE", "RR")
 
-THUNDER_DATA_CLASSES = PRECIP_CLASSES | {9, 10}
+# Fallback-Werte, falls die what-Gruppe im HD5 selbst keine Angaben macht
+# (Werte laut Aufgabenstellung fuer den RV-Composite)
+RV_DEFAULT_GAIN = 0.0009999999317806213
+RV_DEFAULT_OFFSET = -0.0009999999317806213
+RV_DEFAULT_NODATA = 4294967295.0
+RV_DEFAULT_UNDETECT = 0.0
 
-# Code 1 Nearest
-FILL_UNCLASSIFIABLE_CODE = 1
-FILL_RADIUS_PX = 8          # Suchradius um jeden Code-1-Pixel
-FILL_MIN_NEIGHBORS = 4      # mind. so viele Niederschlags-Pixel im Radius, sonst bleibt 1
-PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]   # nur echte Niederschlagsklassen
+# Ab dieser Rate (mm/5min - Aufloesung des RV-Produkts) gilt ein Pixel als
+# "hat messbaren Niederschlag" und kommt fuer das Gewitter-/Blitz-Overlay
+# in Frage. Es wird KEINE eigene Niederschlagskarte gerendert - nur die
+# Umkreise um Blitztreffer werden eingefaerbt (siehe apply_thunderstorm_overlay).
+PRECIP_VISIBLE_THRESHOLD_MM = 0.01
+
+# Fuellen von nodata-Luecken: Umkreis-Mittelwert aus validen Nachbarpixeln
+FILL_RADIUS_PX = 8
+FILL_MIN_VALID_NEIGHBORS = 4
 
 # --------------------------------------------------------------------------
 # Gewitter-/Blitz-Overlay (Klasse 11, kommt NICHT aus der HD5-Datei)
@@ -43,12 +57,9 @@ LIGHTNING_BASE_URL = "https://radar.wetterstation-neustadt.de/blitze/archive/"
 LIGHTNING_BACKUP_URL = "https://nowsky.vercel.app/api/lightning"
 LIGHTNING_WINDOW_MINUTES = 5  # nur Blitze der letzten 5 Minuten vor dem Radar-Zeitstempel
 
-
 LIGHTNING_ARCHIVE_TZ = ZoneInfo("Europe/Berlin")
 
-
 LIGHTNING_MARKER_RADIUS_PX = 8
-
 
 GEWITTER_FOURCC = b"GWTR"
 
@@ -62,19 +73,19 @@ def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 
-
 def parse_timestamp(filename: str) -> datetime:
     m = FILENAME_RE.match(filename)
     if not m:
         raise ValueError(
-            f"Dateiname passt nicht zum erwarteten HymecNG-Schema "
-            f"'composite_HymecNG_yyyymmdd_HHMM_000-hd5': {filename}"
+            f"Dateiname passt nicht zum erwarteten RV-Composite-Schema "
+            f"'composite_rv_yyyymmdd_HHMM_000-hd5': {filename}"
         )
     date_str, time_str, _step = m.groups()
     return datetime.strptime(date_str + time_str, "%Y%m%d%H%M")
 
 
-def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
+def find_data_dataset(h5file: h5py.File) -> h5py.Dataset:
+    """Sucht den 2D-Rohdatensatz mit quantity=ACRR (bzw. aehnlich)."""
 
     candidates = []
 
@@ -97,57 +108,79 @@ def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
             if isinstance(quantity, bytes):
                 quantity = quantity.decode(errors="ignore")
             quantity = str(quantity).upper()
-            if any(k in quantity for k in ("CLASS", "PRECIP", "HCLASS", "TYPE")):
+            if any(k in quantity for k in RV_QUANTITY_KEYWORDS):
                 return ds
 
     # Fallback: ersten gefundenen 2D-Datensatz verwenden
     return candidates[0]
 
 
-def fill_unclassifiable(
-    class_array: np.ndarray,
-    code: int = FILL_UNCLASSIFIABLE_CODE,
+def read_precip_mm(ds: h5py.Dataset) -> np.ndarray:
+    """Wandelt die Rohwerte des RV-Datensatzes in mm/5min um.
+
+    nodata -> NaN (keine Messung), undetect -> 0.0 (gemessen, kein Niederschlag).
+    gain/offset/nodata/undetect werden bevorzugt aus der what-Gruppe des
+    Datensatzes gelesen, sonst greifen die RV_DEFAULT_*-Konstanten."""
+    raw = ds[()].astype(np.float64)
+
+    what_grp = ds.parent.get("what")
+
+    def attr_or_default(name, default):
+        if what_grp is not None and name in what_grp.attrs:
+            return float(what_grp.attrs[name])
+        return default
+
+    gain = attr_or_default("gain", RV_DEFAULT_GAIN)
+    offset = attr_or_default("offset", RV_DEFAULT_OFFSET)
+    nodata = attr_or_default("nodata", RV_DEFAULT_NODATA)
+    undetect = attr_or_default("undetect", RV_DEFAULT_UNDETECT)
+
+    nodata_mask = raw == nodata
+    undetect_mask = raw == undetect
+
+    precip = raw * gain + offset
+    precip[undetect_mask] = 0.0
+    precip[nodata_mask] = np.nan
+
+    # Rundungsbedingtes leichtes Minus (offset == -gain) auf 0 klemmen
+    negative_valid = (~nodata_mask) & (precip < 0)
+    precip[negative_valid] = 0.0
+
+    return precip
+
+
+def fill_nodata(
+    precip: np.ndarray,
     radius: int = FILL_RADIUS_PX,
-    min_neighbors: int = FILL_MIN_NEIGHBORS,
+    min_valid: int = FILL_MIN_VALID_NEIGHBORS,
 ) -> np.ndarray:
-    """Ersetzt 'code' durch den haeufigsten Niederschlagscode im Kreis um den Pixel.
+    """Ersetzt NaN-Pixel (nodata) durch den Umkreis-Mittelwert der validen
+    Nachbarwerte, sofern mindestens 'min_valid' valide Pixel im Radius
+    liegen. Sonst bleibt der Pixel NaN (= transparent)."""
+    nan_mask = np.isnan(precip)
+    if not nan_mask.any():
+        return precip
 
-    Pixel mit dem Code 'code' (nicht klassifizierbar) werden dem am haeufigsten
-    vorkommenden Niederschlagscode in ihrer Kreisumgebung zugewiesen, sofern
-    mindestens 'min_neighbors' Niederschlags-Pixel im Radius liegen. Sonst
-    bleibt der Pixel unveraendert."""
-    bad = class_array == code
-    if not bad.any():
-        return class_array
+    valid = ~nan_mask
 
-    # Kreis-Kernel
     off = np.arange(-radius, radius + 1)
     dr, dc = np.meshgrid(off, off, indexing="ij")
     kernel = (dr * dr + dc * dc <= radius * radius).astype(np.float32)
 
-    # Pro Code zaehlen, wie oft er im Kreis vorkommt
-    codes = [c for c in PRECIP_SOURCE_CODES if (class_array == c).any()]
-    if not codes:
-        return class_array
+    valid_f = valid.astype(np.float32)
+    values_f = np.where(valid, precip, 0.0).astype(np.float32)
 
-    counts = np.stack([
-        fftconvolve((class_array == c).astype(np.float32), kernel, mode="same")
-        for c in codes
-    ])                                   # Form: (n_codes, H, W)
-    counts = np.rint(counts)             # FFT-Rundungsrauschen entfernen
+    count = np.rint(fftconvolve(valid_f, kernel, mode="same"))
+    total = fftconvolve(values_f, kernel, mode="same")
+    mean = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
 
-    best_idx = counts.argmax(axis=0)
-    best_cnt = counts.max(axis=0)
-    best_code = np.asarray(codes)[best_idx]
-
-    fill = bad & (best_cnt >= min_neighbors)
-    out = class_array.copy()
-    out[fill] = best_code[fill]
+    fill_mask = nan_mask & (count >= min_valid)
+    out = precip.copy()
+    out[fill_mask] = mean[fill_mask]
     return out
 
 
 def lightning_url_for_timestamp(ts: datetime) -> str:
-
     ts_utc = ts.replace(tzinfo=timezone.utc)
     ts_local = ts_utc.astimezone(LIGHTNING_ARCHIVE_TZ)
     return f"{LIGHTNING_BASE_URL}{ts_local:%Y-%m-%d-%H%M}.json"
@@ -180,7 +213,6 @@ def fetch_recent_strikes_backup(ts: datetime, minutes: int = LIGHTNING_WINDOW_MI
 
 
 def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
-
     url = lightning_url_for_timestamp(ts)
     try:
         resp = requests.get(url, timeout=30)
@@ -210,7 +242,6 @@ def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) 
 
 
 def find_where_group(h5file: h5py.File):
-
     required = ("projdef", "xsize", "ysize", "xscale", "yscale", "LL_lon", "LL_lat")
 
     root_where = h5file.get("where")
@@ -229,7 +260,6 @@ def find_where_group(h5file: h5py.File):
 
 
 def extract_grid_info(where_grp: h5py.Group) -> dict:
-
     def attr_str(name):
         v = where_grp.attrs[name]
         return v.decode() if isinstance(v, bytes) else str(v)
@@ -249,7 +279,6 @@ def extract_grid_info(where_grp: h5py.Group) -> dict:
 
 
 def build_pixel_mapper(grid_info: dict):
-
     projdef = grid_info["projdef"]
     xsize = grid_info["xsize"]
     ysize = grid_info["ysize"]
@@ -274,21 +303,22 @@ def build_pixel_mapper(grid_info: dict):
 
 
 def apply_thunderstorm_overlay(
-    rgba: np.ndarray, class_array: np.ndarray, ts: datetime, grid_info: dict
+    rgba: np.ndarray, precip: np.ndarray, ts: datetime, grid_info: dict
 ) -> tuple[int, np.ndarray]:
-
+    """Faerbt Pixel mit Blitztreffer UND messbarem Niederschlag
+    (>= PRECIP_VISIBLE_THRESHOLD_MM) als Gewitter (Klasse 11) ein."""
 
     mapper = build_pixel_mapper(grid_info)
     strikes = fetch_recent_strikes(ts, minutes=LIGHTNING_WINDOW_MINUTES)
     print(f"{len(strikes)} Blitze in den letzten {LIGHTNING_WINDOW_MINUTES} Minuten geladen.")
 
-    ysize, xsize = class_array.shape
+    ysize, xsize = precip.shape
     r, g, b = hex_to_rgb(THUNDER_COLOR_HEX)
     radius = LIGHTNING_MARKER_RADIUS_PX
 
-    combined_mask = np.isin(class_array, list(THUNDER_DATA_CLASSES))
+    safe_precip = np.nan_to_num(precip, nan=-1.0)
+    combined_mask = safe_precip >= PRECIP_VISIBLE_THRESHOLD_MM
     thunder_mask = np.zeros((ysize, xsize), dtype=bool)
-
 
     offsets = np.arange(-radius, radius + 1)
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
@@ -301,7 +331,7 @@ def apply_thunderstorm_overlay(
         if pixel is None:
             continue
         row, col = pixel
-        if class_array[row, col] not in THUNDER_DATA_CLASSES:
+        if safe_precip[row, col] < PRECIP_VISIBLE_THRESHOLD_MM:
             continue
 
         row_start = max(0, row - radius)
@@ -338,7 +368,6 @@ def compute_projection_extent(grid_info: dict) -> list[float]:
 def embed_thunderstorm_chunk(
     webp_path: Path, thunder_mask: np.ndarray, extent: list[float]
 ) -> None:
-    
     height, width = thunder_mask.shape
     # 0 = kein Gewitter, 1 = Gewitter. Kein Quantisierungsverlust moeglich,
     # da die Maske ohnehin nur 0/1 kennt - das Quantum-Feld wird trotzdem mit
@@ -355,7 +384,7 @@ def embed_thunderstorm_chunk(
     size = len(payload)
     chunk = GEWITTER_FOURCC + struct.pack("<I", size) + payload
     if size % 2 == 1:
-        chunk += b"\x00" 
+        chunk += b"\x00"
 
     with open(webp_path, "rb") as f:
         content = f.read()
@@ -383,29 +412,31 @@ def save_webp(rgba_array: np.ndarray, out_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 def main() -> None:
-    src_dir = Path("data/hymecng")
-
     candidates = sorted(
-        p for p in src_dir.glob("composite_HymecNG_*-hd5")
+        p for p in SRC_DIR.glob("composite_rv_*-hd5")
         if FILENAME_RE.match(p.name)
     )
     if not candidates:
-        sys.exit(f"Keine HymecNG-Datei in {src_dir} gefunden.")
+        sys.exit(f"Keine RV-Composite-Datei in {SRC_DIR} gefunden.")
 
     src_path = candidates[-1]
     filename = src_path.name
     ts = parse_timestamp(filename)
 
     with h5py.File(src_path, "r") as f:
-        ds = find_classification_dataset(f)
-        class_array = ds[()]
+        ds = find_data_dataset(f)
+        precip = read_precip_mm(ds)
         where_grp = find_where_group(f)
         grid_info = extract_grid_info(where_grp) if where_grp is not None else None
 
-    # Nicht klassifizierbare Pixel (Code 1) dem naechstliegenden Niederschlagscode zuweisen
-    class_array = fill_unclassifiable(class_array)
+    # Fehlende Messungen (nodata) aus der Nachbarschaft auffuellen, damit
+    # Blitze am Rand von Messluecken den Niederschlag in der Naehe trotzdem
+    # erkennen
+    precip = fill_nodata(precip)
 
-    height, width = class_array.shape
+    height, width = precip.shape
+    # Vollstaendig transparentes Bild - es wird NUR der Gewitter-/Blitz-
+    # Umkreis eingefaerbt, keine eigene Niederschlagskarte gerendert.
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
 
     thunder_mask = None
@@ -418,7 +449,7 @@ def main() -> None:
         )
     else:
         try:
-            hits, thunder_mask = apply_thunderstorm_overlay(rgba, class_array, ts, grid_info)
+            hits, thunder_mask = apply_thunderstorm_overlay(rgba, precip, ts, grid_info)
             thunder_extent = compute_projection_extent(grid_info)
             print(f"{hits} Blitz-Treffer als Gewitter (Klasse 11, {THUNDER_COLOR_HEX}) eingefaerbt.")
         except requests.RequestException as e:
@@ -428,7 +459,7 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-        out_path = src_dir / "gewitter_latest.webp"
+        out_path = SRC_DIR / OUT_FILENAME
         save_webp(rgba, out_path)
 
     if thunder_mask is not None:
