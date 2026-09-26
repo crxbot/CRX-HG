@@ -37,11 +37,12 @@ RV_DEFAULT_OFFSET = -0.0009999999317806213
 RV_DEFAULT_NODATA = 4294967295.0
 RV_DEFAULT_UNDETECT = 0.0
 
-# Ab dieser Rate (mm/5min - Aufloesung des RV-Produkts) gilt ein Pixel als
-# "hat messbaren Niederschlag" und kommt fuer das Gewitter-/Blitz-Overlay
-# in Frage. Es wird KEINE eigene Niederschlagskarte gerendert - nur die
-# Umkreise um Blitztreffer werden eingefaerbt (siehe apply_thunderstorm_overlay).
-PRECIP_VISIBLE_THRESHOLD_MM = 0.01
+#Umrechnung mm/5min -> mm/h
+MM_PER_5MIN_TO_MM_PER_H = 12.0
+
+# Ab dieser Rate (mm/h, hochgerechnet aus dem 5-Minuten-Wert) gilt ein Pixel
+# als "hat messbaren Niederschlag" 
+PRECIP_VISIBLE_THRESHOLD_MM = 0.1
 
 # Fuellen von nodata-Luecken (auf dem NATIVEN Raster, vor dem Warp):
 # Umkreis-Mittelwert aus validen Nachbarpixeln
@@ -157,6 +158,8 @@ def read_precip_mm(ds: h5py.Dataset) -> np.ndarray:
     # Rundungsbedingtes leichtes Minus (offset == -gain) auf 0 klemmen
     negative_valid = (~nodata_mask) & (precip < 0)
     precip[negative_valid] = 0.0
+
+    precip *= MM_PER_5MIN_TO_MM_PER_H
 
     return precip
 
