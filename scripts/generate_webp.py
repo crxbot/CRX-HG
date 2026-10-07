@@ -372,8 +372,13 @@ def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
     x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
     aspect = (y_max - y_min) / (x_max - x_min)
     out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
-    y_new = np.linspace(y_min, y_max, out_h)
+
+    # Pixelmitten: Der Extent ist die Bildkante (Rand-zu-Rand),
+    # jeder Pixel sitzt in der Mitte seiner Zelle.
+    dx = (x_max - x_min) / WEBMERCATOR_OUT_WIDTH
+    dy = (y_max - y_min) / out_h
+    x_new = x_min + (np.arange(WEBMERCATOR_OUT_WIDTH) + 0.5) * dx
+    y_new = y_min + (np.arange(out_h) + 0.5) * dy
     return x_new, y_new, [x_min, y_min, x_max, y_max]
 
 
@@ -632,8 +637,10 @@ def apply_lightning_overlay(
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
     circle = dr * dr + dc * dc <= radius * radius
 
-    x_min, x_max = x_new[0], x_new[-1]
-    y_min, y_max = y_new[0], y_new[-1]
+    dx = x_new[1] - x_new[0]
+    dy = y_new[1] - y_new[0]
+    x_min, x_max = x_new[0] - dx / 2, x_new[-1] + dx / 2
+    y_min, y_max = y_new[0] - dy / 2, y_new[-1] + dy / 2
 
     thunder_mask = np.zeros((out_h, out_w), dtype=bool)
     hits = 0
@@ -641,8 +648,10 @@ def apply_lightning_overlay(
         sx, sy = lonlat_to_webmercator(lon, lat)
         if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
             continue
-        col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
-        row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
+        col = int(np.floor((sx - x_min) / (x_max - x_min) * out_w))
+        row = int(np.floor((sy - y_min) / (y_max - y_min) * out_h))
+        col = min(max(col, 0), out_w - 1)
+        row = min(max(row, 0), out_h - 1)
         if not precip_mask[row, col]:
             continue
 
