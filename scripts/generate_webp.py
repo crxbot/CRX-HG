@@ -750,6 +750,22 @@ def embed_chunks(webp_path: Path, chunks: list[bytes]) -> None:
     riff_size = struct.unpack("<I", content[4:8])[0] + len(extra)
     webp_path.write_bytes(content[:4] + struct.pack("<I", riff_size) + content[8:] + extra)
 
+CHUNK_EXCLUDE_CODES = (3, 6, 7)   # Fallback-Typen ohne RV-Intensität
+
+
+def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    has_code = np.isin(class_merc, VALID_OUTPUT_CODES) & ~np.isin(class_merc, CHUNK_EXCLUDE_CODES)
+    code_int = np.where(has_code, class_merc, NO_DATA_IN_CHUNK).astype(np.int16)
+
+    if rate_merc is None:
+        mm_int = np.full(class_merc.shape, NO_DATA_IN_CHUNK, dtype=np.int16)
+    else:
+        has_mm = has_code & ~np.isnan(rate_merc) & (rate_merc >= MIN_PRECIP_RATE_MMH)
+        scaled = np.round(np.nan_to_num(rate_merc, nan=0.0) / MM_QUANTUM)
+        mm_int = np.where(has_mm, np.clip(scaled, 0, 32767), NO_DATA_IN_CHUNK).astype(np.int16)
+
+    return mm_int, code_int
+
 
 def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
     """Erzeugt (mm_int16, code_int16). Wo keine echten Daten vorliegen, steht
