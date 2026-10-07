@@ -1,271 +1,136 @@
 #!/usr/bin/env python3
-import argparse
 import re
 import struct
 import sys
 import zlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
 import h5py
 import numpy as np
 import requests
 from PIL import Image
 from pyproj import Transformer
-from scipy.signal import fftconvolve
+from scipy import ndimage
+from scipy.ndimage import map_coordinates
 
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Konfiguration
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+SRC_DIR = Path("data/hymecng")
+RV_SRC_DIR = Path("data/rv")          # ANPASSEN: Ablageort der RV-Composites
+OUT_DIR = Path("output/hymecng")
+OUT_FILENAME = "hg_latest.webp"
 
-# Dateinamensschema laut DWD: composite_rv_yyyymmdd_HHMM_000-hd5
-FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
+FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
+RV_FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
 
-SRC_DIR = Path("data/rv")
-OUT_FILENAME = "gewitter_latest.webp"
+# Wettercodes fuer Gewitter / Hagel-Umwandlung
+THUNDER_CODE = 11
+STRONG_THUNDER_CODE = 12          # Blitz in Hagelzone
+HAIL_NO_THUNDER_CODE = 32         # Hagel ohne Blitz -> Regen
 
-# --------------------------------------------------------------------------
-# RV-Composite: quantitatives Produkt (quantity=ACRR, mm pro 5 Minuten)
-# --------------------------------------------------------------------------
+THUNDER_COLOR = "#FD5FFF"
+STRONG_THUNDER_COLOR = "#BA1ABC"  # Blitz in Hagelzone
 
-RV_QUANTITY_KEYWORDS = ("ACRR", "RATE", "RR")
+# Chunks (Header-Layout wie GWTR in Dokument 2)
+MM_FOURCC = b"HGMM"               # Niederschlag mm/h
+CODE_FOURCC = b"HGWC"             # Wettercode
+TS_FOURCC = b"HGTS"               # Zeitstempel + Quelldateien
+MM_QUANTUM = 0.01                 # int16-Wert * 0.01 = mm/h
+NO_DATA_IN_CHUNK = 0              # "kein Wert" in den Chunks (niemals -1 oder 1)
 
-# Fallback-Werte, falls die what-Gruppe im HD5 selbst keine Angaben macht
-# (Werte laut Aufgabenstellung fuer den RV-Composite)
-RV_DEFAULT_GAIN = 0.0009999999317806213
-RV_DEFAULT_OFFSET = -0.0009999999317806213
-RV_DEFAULT_NODATA = 4294967295.0
-RV_DEFAULT_UNDETECT = 0.0
+PRECIP_COLORS: dict[int, str] = {
+    31: "#43FF43",  # Regen leicht
+    32: "#34C134",  # Regen maessig
+    33: "#008200",  # Regen stark
+    3:  "#43FF43",  # Fallback fuer Regen ohne RV
+    4: "#FF4343",
+    5: "#C80000",
+    6:  "#FFC189",  # Schneeregen ohne RV (Fallback)
+    61: "#FFC189",  # Schneeregen leicht
+    62: "#FF973A",  # Schneeregen maessig/stark
+    7: "#47F0FF",
+    71: "#47F0FF",
+    72: "#478CFF",
+    73: "#3568BD",
+    8: "#3568BD",
+    9: "#008000",   # Hagel (wird vor dem Einfaerben zu 32 umgewandelt)
+    10: "#008000",
+    11: THUNDER_COLOR,
+    12: STRONG_THUNDER_COLOR,
+}
+HAIL_CLASSES = {9, 10}
 
-#Umrechnung mm/5min -> mm/h
-MM_PER_5MIN_TO_MM_PER_H = 12.0
+# Alle Codes, die im Bild eine Farbe haben = echte Daten (fuer die Chunks)
+VALID_OUTPUT_CODES = np.array(sorted(PRECIP_COLORS.keys()), dtype=np.int32)
 
-# Ab dieser Rate (mm/h, hochgerechnet aus dem 5-Minuten-Wert) gilt ein Pixel
-# als "hat messbaren Niederschlag" 
-PRECIP_VISIBLE_THRESHOLD_MM = 0.1
+# SCHWELLWERTE
+RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
+    (0.1, 1.25, 31),
+    (1.25, 10.0, 32),
+    (10.0, float("inf"), 33),
+]
 
-# Fuellen von nodata-Luecken (auf dem NATIVEN Raster, vor dem Warp):
-# Umkreis-Mittelwert aus validen Nachbarpixeln
-FILL_RADIUS_PX = 8
-FILL_MIN_VALID_NEIGHBORS = 4
+SNOW_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
+    (0.1, 1.0, 71),
+    (1.0, 4.0, 72),
+    (4.0, float("inf"), 73),
+]
 
-# --------------------------------------------------------------------------
-# Gewitter-/Blitz-Overlay (Klasse 11, kommt NICHT aus der HD5-Datei)
-# --------------------------------------------------------------------------
+SLEET_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
+    (0.1, 1.0, 61),
+    (1.0, float("inf"), 62),
+]
 
-THUNDER_COLOR_HEX = "#FD5FFF"
+PRESERVE_PRECIP_TYPE_CODES = {8, 9, 10}
 
+RAIN_TYPE_CODES = {2, 3, 31, 32, 33}
+SNOW_TYPE_CODES = {7, 71, 72, 73}
+MIXED_TYPE_CODES = {8}
+SLEET_TYPE_CODES = {6, 61, 62}
+FREEZING_RAIN_TYPE_CODES = {4, 5}
+HAIL_TYPE_CODES = {9, 10}
+
+MIN_PRECIP_RATE_MMH = 0.1
+
+# Blitze
 LIGHTNING_BASE_URL = "https://radar.wetterstation-neustadt.de/blitze/archive/"
 LIGHTNING_BACKUP_URL = "https://nowsky.vercel.app/api/lightning"
-LIGHTNING_WINDOW_MINUTES = 5  # nur Blitze der letzten 5 Minuten vor dem Radar-Zeitstempel
-
-LIGHTNING_ARCHIVE_TZ = ZoneInfo("Europe/Berlin")
-
-# Radius in Pixeln AUF DEM WEBMERCATOR-ZIELRASTER (siehe WEBMERCATOR_OUT_WIDTH).
-# Identisch zu Dokument 1, damit beide Overlays bei vergleichbarem
-# Kartenausschnitt visuell gleich groß erscheinen.
+LIGHTNING_WINDOW_MINUTES = 5
 LIGHTNING_MARKER_RADIUS_PX = 8
+LIGHTNING_PRECIP_MMH_THRESHOLD = 0.1
 
-GEWITTER_FOURCC = b"GWTR"
-
-# --------------------------------------------------------------------------
-# Geometrie / Ausgabe (identisch zu Dokument 1, fuer gemeinsames Zielraster)
-# --------------------------------------------------------------------------
+# Geometrie / Ausgabe
+BERLIN = ZoneInfo("Europe/Berlin")
 WEBMERCATOR_OUT_WIDTH = 1927
 EDGE_SAMPLES = 200
 BBOX_MARGIN_DEG = 0.02
 EARTH_RADIUS = 6378137.0
+NODATA_CLASS = -1
+INVISIBLE_CLASS = 1   # Regen ohne RV-Wert -> nicht dargestellt
+
+# RV Meta (nur Fallback)
+RV_DEFAULT_GAIN = 0.0009999999317806213
+RV_DEFAULT_OFFSET = -0.0009999999317806213
+RV_DEFAULT_NODATA = 4294967295.0
+RV_DEFAULT_UNDETECT = 0.0
+RV_STEP_MINUTES = 5.0
+
+PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+REFINED_PRECIP_CODES = [31, 32, 33, 61, 62, 71, 72, 73]
+ALL_PRECIP_CODES = PRECIP_SOURCE_CODES + REFINED_PRECIP_CODES
 
 
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Hilfsfunktionen
-# --------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    hex_color = hex_color.lstrip("#")
-    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    h = hex_color.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
-def parse_timestamp(filename: str) -> datetime:
-    m = FILENAME_RE.match(filename)
-    if not m:
-        raise ValueError(
-            f"Dateiname passt nicht zum erwarteten RV-Composite-Schema "
-            f"'composite_rv_yyyymmdd_HHMM_000-hd5': {filename}"
-        )
-    date_str, time_str, _step = m.groups()
-    return datetime.strptime(date_str + time_str, "%Y%m%d%H%M")
-
-
-def find_data_dataset(h5file: h5py.File) -> h5py.Dataset:
-    """Sucht den 2D-Rohdatensatz mit quantity=ACRR (bzw. aehnlich)."""
-
-    candidates = []
-
-    def visitor(name, obj):
-        if isinstance(obj, h5py.Dataset) and name.endswith("/data") and obj.ndim == 2:
-            candidates.append(obj)
-
-    h5file.visititems(visitor)
-
-    if not candidates:
-        raise RuntimeError(
-            "Kein 2D-Datensatz in der HDF5-Datei gefunden. "
-            "Mit --inspect die Dateistruktur pruefen."
-        )
-
-    for ds in candidates:
-        what_grp = ds.parent.get("what")
-        if what_grp is not None and "quantity" in what_grp.attrs:
-            quantity = what_grp.attrs["quantity"]
-            if isinstance(quantity, bytes):
-                quantity = quantity.decode(errors="ignore")
-            quantity = str(quantity).upper()
-            if any(k in quantity for k in RV_QUANTITY_KEYWORDS):
-                return ds
-
-    # Fallback: ersten gefundenen 2D-Datensatz verwenden
-    return candidates[0]
-
-
-def read_precip_mm(ds: h5py.Dataset) -> np.ndarray:
-    """Wandelt die Rohwerte des RV-Datensatzes in mm/5min um.
-
-    nodata -> NaN (keine Messung), undetect -> 0.0 (gemessen, kein Niederschlag).
-    gain/offset/nodata/undetect werden bevorzugt aus der what-Gruppe des
-    Datensatzes gelesen, sonst greifen die RV_DEFAULT_*-Konstanten."""
-    raw = ds[()].astype(np.float64)
-
-    what_grp = ds.parent.get("what")
-
-    def attr_or_default(name, default):
-        if what_grp is not None and name in what_grp.attrs:
-            return float(what_grp.attrs[name])
-        return default
-
-    gain = attr_or_default("gain", RV_DEFAULT_GAIN)
-    offset = attr_or_default("offset", RV_DEFAULT_OFFSET)
-    nodata = attr_or_default("nodata", RV_DEFAULT_NODATA)
-    undetect = attr_or_default("undetect", RV_DEFAULT_UNDETECT)
-
-    nodata_mask = raw == nodata
-    undetect_mask = raw == undetect
-
-    precip = raw * gain + offset
-    precip[undetect_mask] = 0.0
-    precip[nodata_mask] = np.nan
-
-    # Rundungsbedingtes leichtes Minus (offset == -gain) auf 0 klemmen
-    negative_valid = (~nodata_mask) & (precip < 0)
-    precip[negative_valid] = 0.0
-
-    precip *= MM_PER_5MIN_TO_MM_PER_H
-
-    return precip
-
-
-def lightning_url_for_timestamp(ts: datetime) -> str:
-    ts_utc = ts.replace(tzinfo=timezone.utc)
-    ts_local = ts_utc.astimezone(LIGHTNING_ARCHIVE_TZ)
-    return f"{LIGHTNING_BASE_URL}{ts_local:%Y-%m-%d-%H%M}.json"
-
-
-def _parse_iso_to_ms(iso_str: str) -> int:
-    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    return int(dt.timestamp() * 1000)
-
-
-def fetch_recent_strikes_backup(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
-    """Fallback-Quelle, falls der primaere Archiv-Feed (noch) kein 404-freies
-    JSON fuer den angefragten Zeitstempel liefert. Die Backup-API liefert ein
-    flaches 'strikes'-Array mit lat/lon/time - wir filtern daraus das
-    gewuenschte Fenster [ts - minutes, ts]."""
-    resp = requests.get(LIGHTNING_BACKUP_URL, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-
-    ts_utc = ts.replace(tzinfo=timezone.utc)
-    end_ms = int(ts_utc.timestamp() * 1000)
-    start_ms = end_ms - minutes * 60 * 1000
-
-    strikes = []
-    for s in data.get("strikes", []):
-        t_ms = _parse_iso_to_ms(s["time"])
-        if start_ms <= t_ms <= end_ms:
-            strikes.append((s["lat"], s["lon"]))
-    return strikes
-
-
-def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
-    url = lightning_url_for_timestamp(ts)
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            print(
-                f"Warnung: Primaerer Blitz-Feed liefert 404 ({url}). "
-                "Weiche auf Backup-API aus.",
-                file=sys.stderr,
-            )
-            return fetch_recent_strikes_backup(ts, minutes=minutes)
-        raise
-
-    data = resp.json()
-
-    ts_utc = ts.replace(tzinfo=timezone.utc)
-    end_ms = int(ts_utc.timestamp() * 1000)
-    start_ms = end_ms - minutes * 60 * 1000
-
-    strikes = data.get("strikes", [])
-    return [
-        (s["lat"], s["lon"])
-        for s in strikes
-        if start_ms <= s.get("t", 0) <= end_ms
-    ]
-
-
-def find_where_group(h5file: h5py.File):
-    required = ("projdef", "xsize", "ysize", "xscale", "yscale", "LL_lon", "LL_lat")
-
-    root_where = h5file.get("where")
-    if root_where is not None and all(k in root_where.attrs for k in required):
-        return root_where
-
-    candidates = []
-
-    def visitor(name, obj):
-        if isinstance(obj, h5py.Group) and name.split("/")[-1] == "where":
-            if all(k in obj.attrs for k in required):
-                candidates.append(obj)
-
-    h5file.visititems(visitor)
-    return candidates[0] if candidates else None
-
-
-def extract_grid_info(where_grp: h5py.Group) -> dict:
-    def attr_str(name):
-        v = where_grp.attrs[name]
-        return v.decode() if isinstance(v, bytes) else str(v)
-
-    def attr_num(name):
-        return float(where_grp.attrs[name])
-
-    return {
-        "projdef": attr_str("projdef"),
-        "xsize": int(attr_num("xsize")),
-        "ysize": int(attr_num("ysize")),
-        "xscale": attr_num("xscale"),
-        "yscale": attr_num("yscale"),
-        "ll_lon": attr_num("LL_lon"),
-        "ll_lat": attr_num("LL_lat"),
-    }
-
-
-# --------------------------------------------------------------------------
-# Geometrie / Warp auf EPSG:3857 (uebernommen aus Dokument 1, fuer ein
-# gemeinsames Zielraster beider Skripte)
-# --------------------------------------------------------------------------
 def lonlat_to_webmercator(lon_deg, lat_deg):
     x = EARTH_RADIUS * np.radians(lon_deg)
     y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
@@ -278,6 +143,208 @@ def webmercator_to_lonlat(x, y):
     return lon, lat
 
 
+def parse_timestamp(filename: str, pattern: re.Pattern = FILENAME_RE) -> datetime:
+    """Zeitstempel aus dem Dateinamen (UTC)."""
+    m = pattern.match(filename)
+    if not m:
+        raise ValueError(f"Dateiname passt nicht zum Schema {pattern.pattern}: {filename}")
+    date_str, time_str, _ = m.groups()
+    naive = datetime.strptime(date_str + time_str, "%Y%m%d%H%M")
+    return naive.replace(tzinfo=timezone.utc)
+
+
+def rv_path_for(ts: datetime) -> Path:
+    """Pfad der RV-Analysedatei (Vorhersageschritt 000) zum Zeitstempel."""
+    return RV_SRC_DIR / f"composite_rv_{ts:%Y%m%d}_{ts:%H%M}_000-hd5"
+
+
+# --------------------------------------------------------------------------- #
+# HDF5 lesen
+# --------------------------------------------------------------------------- #
+_DATA_PATH_RE = re.compile(r"(^|/)dataset\d+/data\d+/data$")
+
+
+def _find_2d_dataset_by_quantity(h5file: h5py.File, keywords: tuple[str, ...], error_msg: str) -> h5py.Dataset:
+    candidates: list[h5py.Dataset] = []
+
+    def visitor(name, obj):
+        if isinstance(obj, h5py.Dataset) and obj.ndim == 2 and _DATA_PATH_RE.search(name):
+            candidates.append(obj)
+
+    h5file.visititems(visitor)
+
+    if not candidates:
+        def loose_visitor(name, obj):
+            if (
+                isinstance(obj, h5py.Dataset)
+                and name.endswith("/data")
+                and obj.ndim == 2
+                and "quality" not in name
+            ):
+                candidates.append(obj)
+
+        h5file.visititems(loose_visitor)
+
+    if not candidates:
+        raise RuntimeError(error_msg)
+
+    matches: list[h5py.Dataset] = []
+    for ds in candidates:
+        what = ds.parent.get("what")
+        if what is not None and "quantity" in what.attrs:
+            quantity = what.attrs["quantity"]
+            if isinstance(quantity, bytes):
+                quantity = quantity.decode(errors="ignore")
+            if any(k in str(quantity).upper() for k in keywords):
+                matches.append(ds)
+
+    if matches:
+        if len(matches) > 1:
+            print(
+                f"Warnung: {len(matches)} Datasets passen auf Quantity-Keywords "
+                f"{keywords} — nehme das erste ({matches[0].name}).",
+                file=sys.stderr,
+            )
+        return matches[0]
+
+    candidates.sort(key=lambda ds: ds.name)
+    chosen = candidates[0]
+    print(
+        f"Warnung: keine Quantity passte auf {keywords} in dieser Datei — "
+        f"nehme Fallback-Dataset {chosen.name} (Quantity unbekannt/nicht gesetzt). "
+        f"Bitte pruefen, ob das die richtigen Daten sind!",
+        file=sys.stderr,
+    )
+    return chosen
+
+
+def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
+    return _find_2d_dataset_by_quantity(
+        h5file,
+        keywords=("CLASS", "PRECIP", "HCLASS", "TYPE"),
+        error_msg="Kein 2D-Datensatz in der HymecNG-Datei gefunden.",
+    )
+
+
+def find_rate_dataset(h5file: h5py.File) -> h5py.Dataset:
+    return _find_2d_dataset_by_quantity(
+        h5file,
+        keywords=("RATE", "ACRR"),
+        error_msg="Kein 2D-Datensatz in der RV-Datei gefunden.",
+    )
+
+
+def load_classification_array(h5file: h5py.File, dataset: h5py.Dataset, nodata_class: int) -> np.ndarray:
+    raw = dataset[()]
+    what = dataset.parent.get("what")
+    attrs = what.attrs if what is not None else {}
+
+    def attr_float(key: str):
+        v = attrs.get(key)
+        if v is None:
+            return None
+        return float(np.asarray(v).ravel()[0])
+
+    nodata = attr_float("nodata")
+    undetect = attr_float("undetect")
+    gain = attr_float("gain")
+    offset = attr_float("offset")
+
+    class_arr = raw.astype(np.int32).copy()
+
+    if (gain is not None and gain != 1.0) or (offset is not None and offset != 0.0):
+        print(
+            f"Warnung: Klassifikations-Dataset hat gain={gain}, offset={offset} "
+            f"— fuer Klassencodes ungewoehnlich, bitte pruefen.",
+            file=sys.stderr,
+        )
+
+    mask_invalid = np.zeros_like(class_arr, dtype=bool)
+    if nodata is not None:
+        mask_invalid |= raw == nodata
+    if undetect is not None:
+        mask_invalid |= raw == undetect
+
+    class_arr[mask_invalid] = nodata_class
+    return class_arr
+
+
+def find_where_group(h5file: h5py.File) -> h5py.Group | None:
+    required = ("projdef", "xsize", "ysize", "xscale", "yscale", "LL_lon", "LL_lat")
+
+    def complete(grp) -> bool:
+        return all(k in grp.attrs for k in required)
+
+    root_where = h5file.get("where")
+    if root_where is not None and complete(root_where):
+        return root_where
+
+    found: list[h5py.Group] = []
+
+    def visitor(name, obj):
+        if isinstance(obj, h5py.Group) and name.split("/")[-1] == "where" and complete(obj):
+            found.append(obj)
+
+    h5file.visititems(visitor)
+    return found[0] if found else None
+
+
+def extract_grid_info(where: h5py.Group) -> dict:
+    def as_str(key: str) -> str:
+        v = where.attrs[key]
+        return v.decode() if isinstance(v, bytes) else str(v)
+
+    def as_float(key: str) -> float:
+        return float(where.attrs[key])
+
+    return {
+        "projdef": as_str("projdef"),
+        "xsize": int(as_float("xsize")),
+        "ysize": int(as_float("ysize")),
+        "xscale": as_float("xscale"),
+        "yscale": as_float("yscale"),
+        "ll_lon": as_float("LL_lon"),
+        "ll_lat": as_float("LL_lat"),
+    }
+
+
+def assert_compatible_grids(class_grid: dict, rv_grid: dict, tol: float = 1e-6) -> None:
+    problems = []
+    if class_grid["projdef"] != rv_grid["projdef"]:
+        problems.append(f"projdef: {class_grid['projdef']!r} != {rv_grid['projdef']!r}")
+    for key in ("xscale", "yscale", "ll_lon", "ll_lat"):
+        if abs(class_grid[key] - rv_grid[key]) > tol:
+            problems.append(f"{key}: {class_grid[key]} != {rv_grid[key]}")
+
+    if problems:
+        print(
+            "Warnung: HymecNG- und RV-Grid unterscheiden sich:\n  "
+            + "\n  ".join(problems)
+            + "\nTyp und Intensitaet werden trotzdem unabhaengig gewarpt, "
+              "koennen aber leicht gegeneinander verschoben sein.",
+            file=sys.stderr,
+        )
+
+
+def _attr_float(attrs, key: str, default: float | None = None) -> float | None:
+    v = attrs.get(key)
+    if v is None:
+        return default
+    return float(np.asarray(v).ravel()[0])
+
+
+def _attr_str(attrs, key: str, default: str = "") -> str:
+    v = attrs.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bytes):
+        return v.decode(errors="ignore")
+    return str(v)
+
+
+# --------------------------------------------------------------------------- #
+# Geometrie / Warp
+# --------------------------------------------------------------------------- #
 def native_origin_and_extent(grid: dict, to_proj: Transformer):
     ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
     x_max = ll_x + grid["xsize"] * grid["xscale"]
@@ -286,7 +353,6 @@ def native_origin_and_extent(grid: dict, to_proj: Transformer):
 
 
 def wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84: Transformer):
-    """WGS84-Bounding-Box durch Abtasten des nativen Rasterrands."""
     t = np.linspace(0.0, 1.0, EDGE_SAMPLES)
     xs_span = ll_x + t * (x_max - ll_x)
     ys_span = ll_y + t * (y_max - ll_y)
@@ -319,7 +385,7 @@ def nearest_neighbor_warp(
     y_new: np.ndarray,
     fill_value: float,
 ) -> np.ndarray:
-    """Nearest-Neighbor-Warp eines nativen Rasters auf EPSG:3857."""
+    """Nearest-Neighbor-Warp (fuer diskrete Klassencodes)."""
     xx, yy = np.meshgrid(x_new, y_new)
     lon, lat = webmercator_to_lonlat(xx, yy)
     x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
@@ -328,8 +394,8 @@ def nearest_neighbor_warp(
 
     ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
 
-    col = np.round((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
-    row = np.round(grid["ysize"] - 1 - (y_nat - ll_y) / grid["yscale"]).astype(np.int64)
+    col = np.floor((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
+    row = (grid["ysize"] - 1 - np.floor((y_nat - ll_y) / grid["yscale"])).astype(np.int64)
     valid = (col >= 0) & (col < grid["xsize"]) & (row >= 0) & (row < grid["ysize"])
 
     out = np.full(xx.shape, fill_value, dtype=np.float64)
@@ -337,183 +403,444 @@ def nearest_neighbor_warp(
     return out
 
 
-# --------------------------------------------------------------------------
-# Gewitter-/Blitz-Overlay auf dem Webmercator-Zielraster
-# --------------------------------------------------------------------------
-def apply_thunderstorm_overlay(
-    rgba: np.ndarray,
-    precip_merc: np.ndarray,
+def bilinear_warp(
+    data: np.ndarray,
+    grid: dict,
+    to_proj: Transformer,
+    x_new: np.ndarray,
+    y_new: np.ndarray,
+    fill_value: float,
+) -> np.ndarray:
+    """Bilinearer Warp fuer kontinuierliche Messwerte (aktuell ungenutzt)."""
+    xx, yy = np.meshgrid(x_new, y_new)
+    lon, lat = webmercator_to_lonlat(xx, yy)
+    x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
+    x_nat = np.asarray(x_nat).reshape(xx.shape)
+    y_nat = np.asarray(y_nat).reshape(xx.shape)
+
+    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
+
+    fcol = (x_nat - ll_x) / grid["xscale"]
+    frow = grid["ysize"] - 1 - (y_nat - ll_y) / grid["yscale"]
+
+    is_nan = np.isnan(data)
+    src = np.where(is_nan, 0.0, data)
+    valid_src = (~is_nan).astype(np.float64)
+
+    coords = [frow.ravel(), fcol.ravel()]
+    val_interp = map_coordinates(src, coords, order=1, mode="constant", cval=0.0)
+    valid_interp = map_coordinates(valid_src, coords, order=1, mode="constant", cval=0.0)
+
+    out = np.where(
+        valid_interp > 0.5,
+        val_interp / np.maximum(valid_interp, 1e-9),
+        fill_value,
+    )
+    return out.reshape(xx.shape)
+
+
+def warp_classification_to_webmercator(
+    class_array: np.ndarray,
+    grid: dict,
+    to_proj: Transformer,
+    x_new: np.ndarray,
+    y_new: np.ndarray,
+) -> np.ndarray:
+    warped = nearest_neighbor_warp(
+        class_array.astype(np.float64), grid, to_proj, x_new, y_new, fill_value=float(NODATA_CLASS)
+    )
+    return np.round(warped).astype(np.int32)
+
+
+# --------------------------------------------------------------------------- #
+# HYBRID-STRATEGIE: RV fuer Detektion + Intensitaet, HymecNG fuer Art
+# --------------------------------------------------------------------------- #
+def refine_with_hybrid_strategy(
+    class_merc: np.ndarray,
+    rate_merc: np.ndarray | None,
+) -> np.ndarray:
+    refined = class_merc.copy()
+
+    if rate_merc is None:
+        mask_rain = class_merc == 3
+        mask_snow = class_merc == 7
+        mask_sleet = class_merc == 6
+        if mask_rain.any():
+            refined[mask_rain] = RAIN_MMH_THRESHOLDS[0][2]
+        if mask_snow.any():
+            refined[mask_snow] = SNOW_MMH_THRESHOLDS[0][2]
+        if mask_sleet.any():
+            refined[mask_sleet] = SLEET_MMH_THRESHOLDS[0][2]
+        if mask_rain.any() or mask_snow.any() or mask_sleet.any():
+            print("Warnung: RV nicht verfügbar, verwende niedrigste Intensitätsstufe als Fallback.", file=sys.stderr)
+        return refined
+
+    # === SCHRITT 1: Pixel mit echtem Niederschlag (RV) ===
+    has_rain = ~np.isnan(rate_merc) & (rate_merc >= MIN_PRECIP_RATE_MMH)
+
+    # === SCHRITT 2: REGEN (Code 3) ===
+    mask_refine_rain = (class_merc == 3) & has_rain
+    for lower, upper, new_code in RAIN_MMH_THRESHOLDS:
+        m = mask_refine_rain & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+
+    mask_rain_below_min = (class_merc == 3) & has_rain & (refined == 3)
+    if mask_rain_below_min.any():
+        refined[mask_rain_below_min] = RAIN_MMH_THRESHOLDS[0][2]
+
+    # === SCHRITT 2b: SCHNEE (Code 7) ===
+    mask_refine_snow = (class_merc == 7) & has_rain
+    for lower, upper, new_code in SNOW_MMH_THRESHOLDS:
+        m = mask_refine_snow & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+
+    mask_snow_below_min = (class_merc == 7) & has_rain & (refined == 7)
+    if mask_snow_below_min.any():
+        refined[mask_snow_below_min] = SNOW_MMH_THRESHOLDS[0][2]
+
+    # === SCHRITT 2c: SCHNEEREGEN (Code 6) ===
+    mask_refine_sleet = (class_merc == 6) & has_rain
+    for lower, upper, new_code in SLEET_MMH_THRESHOLDS:
+        m = mask_refine_sleet & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+
+    mask_sleet_below_min = (class_merc == 6) & has_rain & (refined == 6)
+    if mask_sleet_below_min.any():
+        refined[mask_sleet_below_min] = SLEET_MMH_THRESHOLDS[0][2]
+
+    # === SCHRITT 3: Naechstgelegenen bekannten Niederschlagstyp bestimmen ===
+    known_type = np.isin(class_merc, PRECIP_SOURCE_CODES)
+    if known_type.any():
+        _, (ir, ic) = ndimage.distance_transform_edt(~known_type, return_indices=True)
+        nearest_type = class_merc[ir, ic]
+    else:
+        nearest_type = np.full(class_merc.shape, 3, dtype=class_merc.dtype)
+
+    is_snow_type = np.isin(nearest_type, tuple(SNOW_TYPE_CODES))
+    is_sleet_type = np.isin(nearest_type, tuple(SLEET_TYPE_CODES))
+    is_preserved_type = np.isin(nearest_type, tuple(FREEZING_RAIN_TYPE_CODES | {8} | HAIL_TYPE_CODES))
+    is_rain_type = ~is_snow_type & ~is_sleet_type & ~is_preserved_type
+
+    # === SCHRITT 4: Luecken fuellen ===
+    gap = has_rain & ~np.isin(class_merc, PRECIP_SOURCE_CODES)
+
+    for lower, upper, new_code in RAIN_MMH_THRESHOLDS:
+        m = gap & is_rain_type & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+    for lower, upper, new_code in SNOW_MMH_THRESHOLDS:
+        m = gap & is_snow_type & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+    for lower, upper, new_code in SLEET_MMH_THRESHOLDS:
+        m = gap & is_sleet_type & (rate_merc >= lower) & (rate_merc < upper)
+        refined[m] = new_code
+
+    m = gap & is_preserved_type
+    refined[m] = nearest_type[m]
+
+    return refined
+
+
+# --------------------------------------------------------------------------- #
+# Hagel -> Regen
+# --------------------------------------------------------------------------- #
+def convert_hail_to_rain(class_merc: np.ndarray) -> np.ndarray:
+    """Hagel -> Regen (Code 32), in place. Gibt die Hagel-Maske zurueck,
+    die spaeter fuer 'Blitz in Hagelzone' (Code 12) gebraucht wird."""
+    hail_mask = np.isin(class_merc, tuple(HAIL_CLASSES))
+    class_merc[hail_mask] = HAIL_NO_THUNDER_CODE
+    return hail_mask
+
+
+# --------------------------------------------------------------------------- #
+# Einfaerben
+# --------------------------------------------------------------------------- #
+def colorize(class_merc: np.ndarray) -> np.ndarray:
+    rgba = np.zeros((*class_merc.shape, 4), dtype=np.uint8)
+    for cls, hex_color in PRECIP_COLORS.items():
+        r, g, b = hex_to_rgb(hex_color)
+        rgba[class_merc == cls] = (r, g, b, 255)
+    return rgba
+
+
+# --------------------------------------------------------------------------- #
+# Blitze
+# --------------------------------------------------------------------------- #
+def _window_ms(ts: datetime, minutes: int) -> tuple[int, int]:
+    end = int(ts.timestamp() * 1000)
+    return end - minutes * 60_000, end
+
+
+def _fetch_strikes_primary(ts: datetime, minutes: int) -> list[tuple[float, float]]:
+    ts_local = ts.astimezone(BERLIN)
+    url = f"{LIGHTNING_BASE_URL}{ts_local:%Y-%m-%d-%H%M}.json"
+    resp = requests.get(url, timeout=30)
+    if resp.status_code == 404:
+        print(f"Warnung: Primaerer Blitz-Feed liefert 404 ({url}) - nutze Backup-API.", file=sys.stderr)
+        raise FileNotFoundError(url)
+    resp.raise_for_status()
+
+    start_ms, end_ms = _window_ms(ts, minutes)
+    return [
+        (s["lat"], s["lon"])
+        for s in resp.json().get("strikes", [])
+        if start_ms <= s.get("t", 0) <= end_ms
+    ]
+
+
+def _fetch_strikes_backup(ts: datetime, minutes: int) -> list[tuple[float, float]]:
+    resp = requests.get(LIGHTNING_BACKUP_URL, timeout=30)
+    resp.raise_for_status()
+
+    start_ms, end_ms = _window_ms(ts, minutes)
+    strikes = []
+    for s in resp.json().get("strikes", []):
+        t_ms = int(datetime.fromisoformat(s["time"].replace("Z", "+00:00")).timestamp() * 1000)
+        if start_ms <= t_ms <= end_ms:
+            strikes.append((s["lat"], s["lon"]))
+    return strikes
+
+
+def fetch_recent_strikes(ts: datetime, minutes: int = LIGHTNING_WINDOW_MINUTES) -> list[tuple[float, float]]:
+    try:
+        return _fetch_strikes_primary(ts, minutes)
+    except FileNotFoundError:
+        return _fetch_strikes_backup(ts, minutes)
+
+
+def apply_lightning_overlay(
+    class_merc: np.ndarray,          # wird IN PLACE veraendert
+    hail_mask: np.ndarray,
+    rate_merc: np.ndarray | None,
     ts: datetime,
     x_new: np.ndarray,
     y_new: np.ndarray,
-) -> tuple[int, np.ndarray]:
-    """Faerbt Pixel mit Blitztreffer UND messbarem Niederschlag
-    (>= PRECIP_VISIBLE_THRESHOLD_MM) als Gewitter (Klasse 11) ein.
-    Arbeitet auf dem bereits gewarpten Webmercator-Raster."""
-
-    strikes = fetch_recent_strikes(ts, minutes=LIGHTNING_WINDOW_MINUTES)
+) -> int:
+    """Schreibt Gewittercodes (11 / 12) in class_merc und ersetzt damit den
+    darunterliegenden Wert. Gibt die Trefferzahl zurueck."""
+    strikes = fetch_recent_strikes(ts)
     print(f"{len(strikes)} Blitze in den letzten {LIGHTNING_WINDOW_MINUTES} Minuten geladen.")
 
-    out_h, out_w = precip_merc.shape
-    r, g, b = hex_to_rgb(THUNDER_COLOR_HEX)
+    out_h, out_w = class_merc.shape
     radius = LIGHTNING_MARKER_RADIUS_PX
 
-    safe_precip = np.nan_to_num(precip_merc, nan=-1.0)
-    combined_mask = safe_precip >= PRECIP_VISIBLE_THRESHOLD_MM
-    thunder_mask = np.zeros((out_h, out_w), dtype=bool)
+    precip_mask = np.isin(class_merc, ALL_PRECIP_CODES)
+    if rate_merc is not None:
+        rate_ok = np.isnan(rate_merc) | (rate_merc >= LIGHTNING_PRECIP_MMH_THRESHOLD)
+        precip_mask &= rate_ok
 
     offsets = np.arange(-radius, radius + 1)
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
-    circle_mask_full = (dr * dr + dc * dc) <= radius * radius
+    circle = dr * dr + dc * dc <= radius * radius
 
     x_min, x_max = x_new[0], x_new[-1]
     y_min, y_max = y_new[0], y_new[-1]
 
-    hit_count = 0
-
+    thunder_mask = np.zeros((out_h, out_w), dtype=bool)
+    hits = 0
     for lat, lon in strikes:
         sx, sy = lonlat_to_webmercator(lon, lat)
         if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
             continue
         col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
         row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
-        if safe_precip[row, col] < PRECIP_VISIBLE_THRESHOLD_MM:
+        if not precip_mask[row, col]:
             continue
 
-        row_start = max(0, row - radius)
-        row_end = min(out_h, row + radius + 1)
-        col_start = max(0, col - radius)
-        col_end = min(out_w, col + radius + 1)
+        r0, r1 = max(0, row - radius), min(out_h, row + radius + 1)
+        c0, c1 = max(0, col - radius), min(out_w, col + radius + 1)
+        circ = circle[r0 - (row - radius): r1 - (row - radius),
+                      c0 - (col - radius): c1 - (col - radius)]
 
-        mask_row_start = row_start - (row - radius)
-        mask_row_end = mask_row_start + (row_end - row_start)
-        mask_col_start = col_start - (col - radius)
-        mask_col_end = mask_col_start + (col_end - col_start)
-        circle_mask = circle_mask_full[
-            mask_row_start:mask_row_end, mask_col_start:mask_col_end
-        ]
+        thunder_mask[r0:r1, c0:c1] |= precip_mask[r0:r1, c0:c1] & circ
+        hits += 1
 
-        area = combined_mask[row_start:row_end, col_start:col_end]
-        final_mask = circle_mask & area
-        rgba[row_start:row_end, col_start:col_end][final_mask] = (r, g, b, 255)
-        thunder_mask[row_start:row_end, col_start:col_end] |= final_mask
-
-        hit_count += 1
-
-    return hit_count, thunder_mask
+    # Erst normaler Blitz, dann starker Blitz (Hagelzone) darueber
+    class_merc[thunder_mask] = THUNDER_CODE
+    class_merc[thunder_mask & hail_mask] = STRONG_THUNDER_CODE
+    return hits
 
 
-def embed_thunderstorm_chunk(
-    webp_path: Path, thunder_mask: np.ndarray, extent: list[float]
-) -> None:
-    height, width = thunder_mask.shape
-    # 0 = kein Gewitter, 1 = Gewitter. Kein Quantisierungsverlust moeglich,
-    # da die Maske ohnehin nur 0/1 kennt - das Quantum-Feld wird trotzdem mit
-    # eingebettet, damit das Chunk-Format zu anderen DVAL-artigen Chunks
-    # kompatibel bleibt.
-    quant = thunder_mask.astype(np.int16)
+# --------------------------------------------------------------------------- #
+# RV-Composite laden + auf Zielraster warpen
+# --------------------------------------------------------------------------- #
+def load_rv_rate_on_target_grid(rv_path: Path, x_new: np.ndarray, y_new: np.ndarray) -> tuple[np.ndarray, dict]:
+    with h5py.File(rv_path, "r") as f:
+        ds = find_rate_dataset(f)
+        raw = ds[()]
+        what = ds.parent.get("what")
+        attrs = what.attrs if what is not None else {}
+        quantity = _attr_str(attrs, "quantity").upper()
+        gain = _attr_float(attrs, "gain", RV_DEFAULT_GAIN)
+        offset = _attr_float(attrs, "offset", RV_DEFAULT_OFFSET)
+        nodata = _attr_float(attrs, "nodata", RV_DEFAULT_NODATA)
+        undetect = _attr_float(attrs, "undetect", RV_DEFAULT_UNDETECT)
 
+        where = find_where_group(f)
+        if where is None:
+            raise RuntimeError("Keine 'where'-Projektionsinfo in der RV-Datei gefunden.")
+        grid = extract_grid_info(where)
+
+    rate = raw.astype(np.float64) * gain + offset
+    if undetect is not None:
+        rate[raw == undetect] = 0.0
+    if nodata is not None:
+        rate[raw == nodata] = np.nan
+
+    # ACRR (mm pro Zeitschritt) -> mm/h; RATE ist bereits mm/h
+    if "RATE" not in quantity:
+        rate *= 60.0 / RV_STEP_MINUTES
+
+    print(
+        f"RV-Composite: {rv_path.name} (quantity={quantity or '?'}, gain={gain}, offset={offset}, "
+        f"nodata={nodata}, undetect={undetect}, Raster {grid['xsize']}x{grid['ysize']})"
+    )
+
+    to_proj_rv = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
+    rate_merc = nearest_neighbor_warp(rate, grid, to_proj_rv, x_new, y_new, fill_value=np.nan)
+    return rate_merc, grid
+
+
+# --------------------------------------------------------------------------- #
+# Chunks (Format wie in Dokument 2)
+# --------------------------------------------------------------------------- #
+def build_raster_chunk(fourcc: bytes, arr_int16: np.ndarray, extent: list[float], quantum: float) -> bytes:
+    """Layout: <BBII version=2, typ=1, width, height | 4 double extent |
+    1 double quantum | zlib(int16 little endian)>"""
+    height, width = arr_int16.shape
     header = struct.pack("<BBII", 2, 1, width, height)
     header += struct.pack("<4d", *extent)
-    header += struct.pack("<d", 1.0)  # Quantum (bei 0/1-Maske irrelevant)
-    compressed = zlib.compress(np.ascontiguousarray(quant, dtype="<i2").tobytes(), level=9)
-    payload = header + compressed
+    header += struct.pack("<d", quantum)
+    compressed = zlib.compress(np.ascontiguousarray(arr_int16, dtype="<i2").tobytes(), level=9)
+    return _wrap_chunk(fourcc, header + compressed)
 
-    size = len(payload)
-    chunk = GEWITTER_FOURCC + struct.pack("<I", size) + payload
-    if size % 2 == 1:
+
+def build_timestamp_chunk(ts: datetime, hymec_name: str, rv_name: str | None) -> bytes:
+    """Layout: <B version=1 | q epoch_seconds_utc | H len + hymec_name (utf-8)
+    | H len + rv_name (utf-8, Laenge 0 = keine RV-Datei)>"""
+    hymec_b = hymec_name.encode("utf-8")
+    rv_b = (rv_name or "").encode("utf-8")
+    payload = struct.pack("<Bq", 1, int(ts.timestamp()))
+    payload += struct.pack("<H", len(hymec_b)) + hymec_b
+    payload += struct.pack("<H", len(rv_b)) + rv_b
+    return _wrap_chunk(TS_FOURCC, payload)
+
+
+def _wrap_chunk(fourcc: bytes, payload: bytes) -> bytes:
+    chunk = fourcc + struct.pack("<I", len(payload)) + payload
+    if len(payload) % 2 == 1:
         chunk += b"\x00"
+    return chunk
 
-    with open(webp_path, "rb") as f:
-        content = f.read()
 
+def embed_chunks(webp_path: Path, chunks: list[bytes]) -> None:
+    content = webp_path.read_bytes()
     if content[0:4] != b"RIFF" or content[8:12] != b"WEBP":
         raise ValueError(f"{webp_path} ist keine gueltige WebP-Datei (RIFF/WEBP-Header fehlt)")
 
-    riff_size = struct.unpack("<I", content[4:8])[0]
-    new_riff_size = riff_size + len(chunk)
-
-    with open(webp_path, "wb") as f:
-        f.write(content[:4])
-        f.write(struct.pack("<I", new_riff_size))
-        f.write(content[8:])
-        f.write(chunk)
+    extra = b"".join(chunks)
+    riff_size = struct.unpack("<I", content[4:8])[0] + len(extra)
+    webp_path.write_bytes(content[:4] + struct.pack("<I", riff_size) + content[8:] + extra)
 
 
-def save_webp(rgba_array: np.ndarray, out_path: Path) -> None:
-    img = Image.fromarray(rgba_array, mode="RGBA")
-    img.save(out_path, format="WEBP", lossless=True)
+def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    """Erzeugt (mm_int16, code_int16). Wo keine echten Daten vorliegen, steht
+    NO_DATA_IN_CHUNK (0) -- niemals -1 oder 1.
+
+    - Wettercode: nur Codes mit Farbe (= tatsaechlich dargestellte Klassen).
+    - mm/h: nur dort, wo ein Wettercode UND eine gueltige RV-Rate existiert."""
+    has_code = np.isin(class_merc, VALID_OUTPUT_CODES)
+    code_int = np.where(has_code, class_merc, NO_DATA_IN_CHUNK).astype(np.int16)
+
+    if rate_merc is None:
+        mm_int = np.full(class_merc.shape, NO_DATA_IN_CHUNK, dtype=np.int16)
+    else:
+        has_mm = has_code & ~np.isnan(rate_merc)
+        scaled = np.round(np.nan_to_num(rate_merc, nan=0.0) / MM_QUANTUM)
+        mm_int = np.where(has_mm, np.clip(scaled, 0, 32767), NO_DATA_IN_CHUNK).astype(np.int16)
+
+    return mm_int, code_int
 
 
-# --------------------------------------------------------------------------
-# Hauptprogramm
-# --------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
 def main() -> None:
-    candidates = sorted(
-        p for p in SRC_DIR.glob("composite_rv_*-hd5")
-        if FILENAME_RE.match(p.name)
-    )
+    candidates = sorted(p for p in SRC_DIR.glob("composite_HymecNG_*-hd5") if FILENAME_RE.match(p.name))
     if not candidates:
-        sys.exit(f"Keine RV-Composite-Datei in {SRC_DIR} gefunden.")
-
+        sys.exit(f"Keine HymecNG-Datei in {SRC_DIR} gefunden.")
     src_path = candidates[-1]
-    filename = src_path.name
-    ts = parse_timestamp(filename)
+    ts = parse_timestamp(src_path.name)
 
     with h5py.File(src_path, "r") as f:
-        ds = find_data_dataset(f)
-        precip = read_precip_mm(ds)
-        where_grp = find_where_group(f)
-        grid_info = extract_grid_info(where_grp) if where_grp is not None else None
+        ds = find_classification_dataset(f)
+        class_array = load_classification_array(f, ds, NODATA_CLASS)
+        class_array[class_array == 2] = 3   # Code 2 wie Code 3 behandeln
+        where = find_where_group(f)
+        if where is None:
+            sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht moeglich.")
+        grid = extract_grid_info(where)
 
-    if grid_info is None:
-        sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht moeglich.")
+    to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
+    to_wgs84 = Transformer.from_crs(grid["projdef"], "EPSG:4326", always_xy=True)
 
-    # Fehlende Messungen (nodata) aus der Nachbarschaft auffuellen (auf dem
-    # nativen Raster), damit Blitze am Rand von Messluecken den
-    # Niederschlag in der Naehe trotzdem erkennen
-
-    to_proj = Transformer.from_crs("EPSG:4326", grid_info["projdef"], always_xy=True)
-    to_wgs84 = Transformer.from_crs(grid_info["projdef"], "EPSG:4326", always_xy=True)
-
-    ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid_info, to_proj)
+    ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid, to_proj)
     lon_min, lon_max, lat_min, lat_max = wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84)
     x_new, y_new, extent = webmercator_target_grid(lon_min, lon_max, lat_min, lat_max)
     print(f"WGS84-BBox: lon [{lon_min:.4f}, {lon_max:.4f}], lat [{lat_min:.4f}, {lat_max:.4f}]")
     print(f"EPSG:3857-Extent [xmin, ymin, xmax, ymax]: {extent}")
     print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
 
-    # Niederschlag unabhaengig auf das gemeinsame Webmercator-Zielraster warpen
-    precip_merc = nearest_neighbor_warp(precip, grid_info, to_proj, x_new, y_new, fill_value=np.nan)
+    # === Schritt 1: Warpen ===
+    class_merc = warp_classification_to_webmercator(class_array, grid, to_proj, x_new, y_new)
 
-    out_h, out_w = len(y_new), len(x_new)
-    # Vollstaendig transparentes Bild - es wird NUR der Gewitter-/Blitz-
-    # Umkreis eingefaerbt, keine eigene Niederschlagskarte gerendert.
-    rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
-
-    thunder_mask = None
+    # === Schritt 2: RV laden ===
+    rate_merc = None
+    rv_name: str | None = None
+    rv_path = rv_path_for(ts)
     try:
-        hits, thunder_mask = apply_thunderstorm_overlay(rgba, precip_merc, ts, x_new, y_new)
-        print(f"{hits} Blitz-Treffer als Gewitter (Klasse 11, {THUNDER_COLOR_HEX}) eingefaerbt.")
+        if not rv_path.exists():
+            raise FileNotFoundError(f"{rv_path} nicht gefunden")
+        rate_merc, rv_grid = load_rv_rate_on_target_grid(rv_path, x_new, y_new)
+        rv_name = rv_path.name
+        assert_compatible_grids(grid, rv_grid)
+    except (RuntimeError, ValueError, KeyError, OSError) as e:
+        print(f"Warnung: RV-Composite nicht verfuegbar ({e}). Nutze HymecNG-Fallback.", file=sys.stderr)
+
+    # === Schritt 3: Hybrid-Verfeinerung ===
+    print("Wende Hybrid-Strategie an (RV + HymecNG)...")
+    class_merc = refine_with_hybrid_strategy(class_merc, rate_merc)
+
+    # === Schritt 3b: Hagel -> Regen (Code 32) ===
+    hail_mask = convert_hail_to_rain(class_merc)
+
+    # === Schritt 4: Blitze (schreibt Gewittercodes in class_merc) ===
+    try:
+        hits = apply_lightning_overlay(class_merc, hail_mask, rate_merc, ts, x_new, y_new)
+        print(f"{hits} Blitz-Treffer als Gewitter markiert.")
     except requests.RequestException as e:
-        print(
-            f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). "
-            "Ueberspringe Gewitter-Overlay.",
-            file=sys.stderr,
-        )
-        thunder_mask = np.zeros((out_h, out_w), dtype=bool)
+        print(f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). Ueberspringe Overlay.", file=sys.stderr)
 
-    out_path = SRC_DIR / OUT_FILENAME
+    # === Schritt 5: Einfaerben (nach dem Overlay -> Bild == Wettercode) ===
+    rgba = colorize(class_merc)
+
+    # === Speichern ===
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUT_DIR / OUT_FILENAME
     # Zeilen umdrehen: y_new laeuft von Sued nach Nord, Bilder von oben nach unten
-    save_webp(rgba[::-1], out_path)
+    Image.fromarray(rgba[::-1], mode="RGBA").save(out_path, format="WEBP", lossless=True)
 
-    embed_thunderstorm_chunk(out_path, thunder_mask[::-1], extent)
+    # === Chunks: mm/h + Wettercode + Zeitstempel ===
+    mm_int, code_int = make_chunk_arrays(class_merc, rate_merc)
+    embed_chunks(out_path, [
+        build_raster_chunk(MM_FOURCC, mm_int[::-1], extent, MM_QUANTUM),
+        build_raster_chunk(CODE_FOURCC, code_int[::-1], extent, 1.0),
+        build_timestamp_chunk(ts, src_path.name, rv_name),
+    ])
     print(
-        f"Gewitter-Datenchunk ({GEWITTER_FOURCC.decode()}) eingebettet: "
-        f"{int(thunder_mask.sum())} Pixel als Gewitter markiert."
+        f"Chunks {MM_FOURCC.decode()} ({int((mm_int > 0).sum())} Pixel mit mm), "
+        f"{CODE_FOURCC.decode()} ({int((code_int != 0).sum())} Pixel mit Code), "
+        f"{TS_FOURCC.decode()} ({ts:%Y-%m-%d %H:%M} UTC) eingebettet."
     )
-
     print(f"Gespeichert: {out_path}")
 
 
