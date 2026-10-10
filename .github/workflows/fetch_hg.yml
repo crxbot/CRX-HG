@@ -119,12 +119,12 @@ jobs:
       - name: Generate WEBP for HymecNG
         run: python scripts/generate_webp.py
 
-      - name: Upload hg_latest.webp to R2 (mit Retry)
+      - name: Upload hg_latest.bin to R2 (mit Retry)
         run: |
           MAX_ATTEMPTS=3
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            if aws s3 cp ./output/hymecng/hg_latest.webp \
-                s3://${{ secrets.R2_BUCKET }}/hymecng/hg_latest.webp \
+            if aws s3 cp ./output/hymecng/hg_latest.bin \
+                s3://${{ secrets.R2_BUCKET }}/hymecng/hg_latest.bin \
                 --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
               echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
               exit 0

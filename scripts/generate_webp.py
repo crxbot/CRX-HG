@@ -2,7 +2,6 @@
 import re
 import struct
 import sys
-import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,7 +9,6 @@ from zoneinfo import ZoneInfo
 import h5py
 import numpy as np
 import requests
-from PIL import Image
 from pyproj import Transformer
 from scipy import ndimage
 from scipy.ndimage import map_coordinates
@@ -21,7 +19,7 @@ from scipy.ndimage import map_coordinates
 SRC_DIR = Path("data/hymecng")
 RV_SRC_DIR = Path("data/rv")          # ANPASSEN: Ablageort der RV-Composites
 OUT_DIR = Path("output/hymecng")
-OUT_FILENAME = "hg_latest.webp"
+BIN_FILENAME = "hg_latest.bin"        # unkomprimierte Pixeldatei fuer den Worker (R2-Range-Reads)
 
 FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
 RV_FILENAME_RE = re.compile(r"composite_rv_(\d{8})_(\d{4})_(\d{3})-hd5")
@@ -31,40 +29,21 @@ THUNDER_CODE = 11
 STRONG_THUNDER_CODE = 12          # Blitz in Hagelzone
 HAIL_NO_THUNDER_CODE = 32         # Hagel ohne Blitz -> Regen
 
-THUNDER_COLOR = "#FD5FFF"
-STRONG_THUNDER_COLOR = "#BA1ABC"  # Blitz in Hagelzone
-
-# Chunks (Header-Layout wie GWTR in Dokument 2)
-MM_FOURCC = b"HGMM"               # Niederschlag mm/h
-CODE_FOURCC = b"HGWC"             # Wettercode
-TS_FOURCC = b"HGTS"               # Zeitstempel + Quelldateien
+# Ausgabewerte
 MM_QUANTUM = 0.01                 # int16-Wert * 0.01 = mm/h
-NO_DATA_IN_CHUNK = 0              # "kein Wert" in den Chunks (niemals -1 oder 1)
+NO_DATA_IN_CHUNK = 0              # "kein Wert" in der .bin (niemals -1 oder 1)
 
-PRECIP_COLORS: dict[int, str] = {
-    31: "#43FF43",  # Regen leicht
-    32: "#34C134",  # Regen maessig
-    33: "#008200",  # Regen stark
-    3:  "#43FF43",  # Fallback fuer Regen ohne RV
-    4: "#FF4343",
-    5: "#C80000",
-    6:  "#FFC189",  # Schneeregen ohne RV (Fallback)
-    61: "#FFC189",  # Schneeregen leicht
-    62: "#FF973A",  # Schneeregen maessig/stark
-    7: "#47F0FF",
-    71: "#47F0FF",
-    72: "#478CFF",
-    73: "#3568BD",
-    8: "#3568BD",
-    9: "#008000",   # Hagel (wird vor dem Einfaerben zu 32 umgewandelt)
-    10: "#008000",
-    11: THUNDER_COLOR,
-    12: STRONG_THUNDER_COLOR,
-}
+# Header der .bin-Datei (muss zu HG_HEADER_SIZE / loadHgHeader im Worker passen)
+#   magic(4s) width(I) height(I) extent(4d) mm_quantum(d) epoch(q) + 4 Byte Padding = 64 Byte
+BIN_MAGIC = b"HGB1"
+BIN_HEADER_FMT = "<4sII4ddq4x"
+
+# Alle Codes, die als echte Daten in die .bin geschrieben werden
+VALID_OUTPUT_CODES = np.array(
+    sorted([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 31, 32, 33, 61, 62, 71, 72, 73]),
+    dtype=np.int32,
+)
 HAIL_CLASSES = {9, 10}
-
-# Alle Codes, die im Bild eine Farbe haben = echte Daten (fuer die Chunks)
-VALID_OUTPUT_CODES = np.array(sorted(PRECIP_COLORS.keys()), dtype=np.int32)
 
 # SCHWELLWERTE
 RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
@@ -126,11 +105,6 @@ ALL_PRECIP_CODES = PRECIP_SOURCE_CODES + REFINED_PRECIP_CODES
 # --------------------------------------------------------------------------- #
 # Hilfsfunktionen
 # --------------------------------------------------------------------------- #
-def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    h = hex_color.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
 def lonlat_to_webmercator(lon_deg, lat_deg):
     x = EARTH_RADIUS * np.radians(lon_deg)
     y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
@@ -552,17 +526,6 @@ def convert_hail_to_rain(class_merc: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Einfaerben
-# --------------------------------------------------------------------------- #
-def colorize(class_merc: np.ndarray) -> np.ndarray:
-    rgba = np.zeros((*class_merc.shape, 4), dtype=np.uint8)
-    for cls, hex_color in PRECIP_COLORS.items():
-        r, g, b = hex_to_rgb(hex_color)
-        rgba[class_merc == cls] = (r, g, b, 255)
-    return rgba
-
-
-# --------------------------------------------------------------------------- #
 # Blitze
 # --------------------------------------------------------------------------- #
 def _window_ms(ts: datetime, minutes: int) -> tuple[int, int]:
@@ -701,68 +664,13 @@ def load_rv_rate_on_target_grid(rv_path: Path, x_new: np.ndarray, y_new: np.ndar
 
 
 # --------------------------------------------------------------------------- #
-# Chunks (Format wie in Dokument 2)
+# Pixel-Arrays + .bin
 # --------------------------------------------------------------------------- #
-def build_raster_chunk(fourcc: bytes, arr_int16: np.ndarray, extent: list[float], quantum: float) -> bytes:
-    """Layout: <BBII version=2, typ=1, width, height | 4 double extent |
-    1 double quantum | zlib(int16 little endian)>"""
-    height, width = arr_int16.shape
-    header = struct.pack("<BBII", 2, 1, width, height)
-    header += struct.pack("<4d", *extent)
-    header += struct.pack("<d", quantum)
-    compressed = zlib.compress(np.ascontiguousarray(arr_int16, dtype="<i2").tobytes(), level=9)
-    return _wrap_chunk(fourcc, header + compressed)
-
-
-def build_timestamp_chunk(ts: datetime, hymec_name: str, rv_name: str | None) -> bytes:
-    """Layout: <B version=1 | q epoch_seconds_utc | H len + hymec_name (utf-8)
-    | H len + rv_name (utf-8, Laenge 0 = keine RV-Datei)>"""
-    hymec_b = hymec_name.encode("utf-8")
-    rv_b = (rv_name or "").encode("utf-8")
-    payload = struct.pack("<Bq", 1, int(ts.timestamp()))
-    payload += struct.pack("<H", len(hymec_b)) + hymec_b
-    payload += struct.pack("<H", len(rv_b)) + rv_b
-    return _wrap_chunk(TS_FOURCC, payload)
-
-
-def _wrap_chunk(fourcc: bytes, payload: bytes) -> bytes:
-    chunk = fourcc + struct.pack("<I", len(payload)) + payload
-    if len(payload) % 2 == 1:
-        chunk += b"\x00"
-    return chunk
-
-
-def embed_chunks(webp_path: Path, chunks: list[bytes]) -> None:
-    content = webp_path.read_bytes()
-    if content[0:4] != b"RIFF" or content[8:12] != b"WEBP":
-        raise ValueError(f"{webp_path} ist keine gueltige WebP-Datei (RIFF/WEBP-Header fehlt)")
-
-    extra = b"".join(chunks)
-    riff_size = struct.unpack("<I", content[4:8])[0] + len(extra)
-    webp_path.write_bytes(content[:4] + struct.pack("<I", riff_size) + content[8:] + extra)
-
-CHUNK_EXCLUDE_CODES = (3, 6, 7)   # Fallback-Typen ohne RV-Intensität
-
-
-def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
-    has_code = np.isin(class_merc, VALID_OUTPUT_CODES) & ~np.isin(class_merc, CHUNK_EXCLUDE_CODES)
-    code_int = np.where(has_code, class_merc, NO_DATA_IN_CHUNK).astype(np.int16)
-
-    if rate_merc is None:
-        mm_int = np.full(class_merc.shape, NO_DATA_IN_CHUNK, dtype=np.int16)
-    else:
-        has_mm = has_code & ~np.isnan(rate_merc) & (rate_merc >= MIN_PRECIP_RATE_MMH)
-        scaled = np.round(np.nan_to_num(rate_merc, nan=0.0) / MM_QUANTUM)
-        mm_int = np.where(has_mm, np.clip(scaled, 0, 32767), NO_DATA_IN_CHUNK).astype(np.int16)
-
-    return mm_int, code_int
-
-
-def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+def make_pixel_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
     """Erzeugt (mm_int16, code_int16). Wo keine echten Daten vorliegen, steht
     NO_DATA_IN_CHUNK (0) -- niemals -1 oder 1.
 
-    - Wettercode: nur Codes mit Farbe (= tatsaechlich dargestellte Klassen).
+    - Wettercode: nur gueltige Ausgabecodes (VALID_OUTPUT_CODES).
     - mm/h: nur dort, wo ein Wettercode UND eine gueltige RV-Rate existiert."""
     has_code = np.isin(class_merc, VALID_OUTPUT_CODES)
     code_int = np.where(has_code, class_merc, NO_DATA_IN_CHUNK).astype(np.int16)
@@ -775,6 +683,37 @@ def make_chunk_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> t
         mm_int = np.where(has_mm, np.clip(scaled, 0, 32767), NO_DATA_IN_CHUNK).astype(np.int16)
 
     return mm_int, code_int
+
+
+def write_pixel_bin(
+    path: Path,
+    mm_int: np.ndarray,
+    code_int: np.ndarray,
+    extent: list[float],
+    ts: datetime,
+) -> None:
+    """Layout (little endian):
+        0   4s   Magic "HGB1"
+        4   u32  width
+        8   u32  height
+        12  4*f64 extent [xmin, ymin, xmax, ymax] (EPSG:3857)
+        44  f64  mm-Quantum
+        52  i64  epoch (UTC, Sekunden)
+        56  4x   Padding  -> Header = 64 Byte
+        64  int16[w*h]          mm/h   (Zeile 0 = Norden)
+        64 + w*h*2  int16[w*h]  Wettercode
+
+    mm_int / code_int kommen in Arbeitsorientierung (Sued -> Nord) und werden
+    hier vertikal gespiegelt (Zeile 0 = Norden)."""
+    height, width = code_int.shape
+    header = struct.pack(
+        BIN_HEADER_FMT, BIN_MAGIC, width, height, *extent, MM_QUANTUM, int(ts.timestamp())
+    )
+    assert len(header) == 64, f"Header hat {len(header)} Byte, erwartet 64"
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(np.ascontiguousarray(mm_int[::-1], dtype="<i2").tobytes())
+        f.write(np.ascontiguousarray(code_int[::-1], dtype="<i2").tobytes())
 
 
 # --------------------------------------------------------------------------- #
@@ -811,13 +750,11 @@ def main() -> None:
 
     # === Schritt 2: RV laden ===
     rate_merc = None
-    rv_name: str | None = None
     rv_path = rv_path_for(ts)
     try:
         if not rv_path.exists():
             raise FileNotFoundError(f"{rv_path} nicht gefunden")
         rate_merc, rv_grid = load_rv_rate_on_target_grid(rv_path, x_new, y_new)
-        rv_name = rv_path.name
         assert_compatible_grids(grid, rv_grid)
     except (RuntimeError, ValueError, KeyError, OSError) as e:
         print(f"Warnung: RV-Composite nicht verfuegbar ({e}). Nutze HymecNG-Fallback.", file=sys.stderr)
@@ -836,28 +773,16 @@ def main() -> None:
     except requests.RequestException as e:
         print(f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). Ueberspringe Overlay.", file=sys.stderr)
 
-    # === Schritt 5: Einfaerben (nach dem Overlay -> Bild == Wettercode) ===
-    rgba = colorize(class_merc)
-
-    # === Speichern ===
+    # === Speichern: nur noch die .bin ===
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / OUT_FILENAME
-    # Zeilen umdrehen: y_new laeuft von Sued nach Nord, Bilder von oben nach unten
-    Image.fromarray(rgba[::-1], mode="RGBA").save(out_path, format="WEBP", lossless=True)
-
-    # === Chunks: mm/h + Wettercode + Zeitstempel ===
-    mm_int, code_int = make_chunk_arrays(class_merc, rate_merc)
-    embed_chunks(out_path, [
-        build_raster_chunk(MM_FOURCC, mm_int[::-1], extent, MM_QUANTUM),
-        build_raster_chunk(CODE_FOURCC, code_int[::-1], extent, 1.0),
-        build_timestamp_chunk(ts, src_path.name, rv_name),
-    ])
+    mm_int, code_int = make_pixel_arrays(class_merc, rate_merc)
+    bin_path = OUT_DIR / BIN_FILENAME
+    write_pixel_bin(bin_path, mm_int, code_int, extent, ts)
     print(
-        f"Chunks {MM_FOURCC.decode()} ({int((mm_int > 0).sum())} Pixel mit mm), "
-        f"{CODE_FOURCC.decode()} ({int((code_int != 0).sum())} Pixel mit Code), "
-        f"{TS_FOURCC.decode()} ({ts:%Y-%m-%d %H:%M} UTC) eingebettet."
+        f"{int((mm_int > 0).sum())} Pixel mit mm, {int((code_int != 0).sum())} Pixel mit Code "
+        f"({ts:%Y-%m-%d %H:%M} UTC)."
     )
-    print(f"Gespeichert: {out_path}")
+    print(f"Gespeichert: {bin_path} ({bin_path.stat().st_size / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
