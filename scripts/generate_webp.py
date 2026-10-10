@@ -346,10 +346,8 @@ def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
     x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
     aspect = (y_max - y_min) / (x_max - x_min)
     out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    dx = (x_max - x_min) / WEBMERCATOR_OUT_WIDTH
-    dy = (y_max - y_min) / out_h
-    x_new = x_min + (np.arange(WEBMERCATOR_OUT_WIDTH) + 0.5) * dx
-    y_new = y_min + (np.arange(out_h) + 0.5) * dy
+    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
+    y_new = np.linspace(y_min, y_max, out_h)
     return x_new, y_new, [x_min, y_min, x_max, y_max]
 
 
@@ -577,7 +575,8 @@ def apply_lightning_overlay(
     hail_mask: np.ndarray,
     rate_merc: np.ndarray | None,
     ts: datetime,
-    extent: list[float],             # [xmin, ymin, xmax, ymax] in EPSG:3857
+    x_new: np.ndarray,
+    y_new: np.ndarray,
 ) -> int:
     """Schreibt Gewittercodes (11 / 12) in class_merc und ersetzt damit den
     darunterliegenden Wert. Gibt die Trefferzahl zurueck."""
@@ -596,7 +595,8 @@ def apply_lightning_overlay(
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
     circle = dr * dr + dc * dc <= radius * radius
 
-    x_min, y_min, x_max, y_max = extent
+    x_min, x_max = x_new[0], x_new[-1]
+    y_min, y_max = y_new[0], y_new[-1]
 
     thunder_mask = np.zeros((out_h, out_w), dtype=bool)
     hits = 0
@@ -604,10 +604,8 @@ def apply_lightning_overlay(
         sx, sy = lonlat_to_webmercator(lon, lat)
         if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
             continue
-        col = int((sx - x_min) / (x_max - x_min) * out_w)
-        row = int((sy - y_min) / (y_max - y_min) * out_h)
-        col = min(max(col, 0), out_w - 1)
-        row = min(max(row, 0), out_h - 1)
+        col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
+        row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
         if not precip_mask[row, col]:
             continue
 
@@ -718,7 +716,6 @@ def write_pixel_bin(
         f.write(np.ascontiguousarray(code_int[::-1], dtype="<i2").tobytes())
 
 
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -750,7 +747,6 @@ def main() -> None:
 
     # === Schritt 1: Warpen ===
     class_merc = warp_classification_to_webmercator(class_array, grid, to_proj, x_new, y_new)
-    class_merc_warped = class_merc.copy()  # fuer Debug / Probe
 
     # === Schritt 2: RV laden ===
     rate_merc = None
@@ -772,12 +768,10 @@ def main() -> None:
 
     # === Schritt 4: Blitze (schreibt Gewittercodes in class_merc) ===
     try:
-        hits = apply_lightning_overlay(class_merc, hail_mask, rate_merc, ts, extent)
+        hits = apply_lightning_overlay(class_merc, hail_mask, rate_merc, ts, x_new, y_new)
         print(f"{hits} Blitz-Treffer als Gewitter markiert.")
     except requests.RequestException as e:
         print(f"Warnung: Blitzdaten konnten nicht geladen werden ({e}). Ueberspringe Overlay.", file=sys.stderr)
-
-
 
     # === Speichern: nur noch die .bin ===
     OUT_DIR.mkdir(parents=True, exist_ok=True)
