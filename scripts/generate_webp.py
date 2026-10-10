@@ -36,11 +36,11 @@ NO_DATA_IN_CHUNK = 0              # "kein Wert" in der .bin (niemals -1 oder 1)
 # Header der .bin-Datei (muss zu HG_HEADER_SIZE / loadHgHeader im Worker passen)
 #   magic(4s) width(I) height(I) extent(4d) mm_quantum(d) epoch(q) + 4 Byte Padding = 64 Byte
 BIN_MAGIC = b"HGB1"
-BIN_HEADER_FMT = "<4sII4ddq4x"
+BIN_HEADER_FMT = "<4sII4ddqB3x"
 
 # Alle Codes, die als echte Daten in die .bin geschrieben werden
 VALID_OUTPUT_CODES = np.array(
-    sorted([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 31, 32, 33, 61, 62, 71, 72, 73]),
+    sorted([4, 5, 8, 9, 10, 11, 12, 31, 32, 33, 61, 62, 71, 72, 73]),
     dtype=np.int32,
 )
 HAIL_CLASSES = {9, 10}
@@ -346,8 +346,10 @@ def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
     x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
     aspect = (y_max - y_min) / (x_max - x_min)
     out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
-    y_new = np.linspace(y_min, y_max, out_h)
+    dx = (x_max - x_min) / WEBMERCATOR_OUT_WIDTH
+    dy = (y_max - y_min) / out_h
+    x_new = x_min + (np.arange(WEBMERCATOR_OUT_WIDTH) + 0.5) * dx
+    y_new = y_min + (np.arange(out_h) + 0.5) * dy
     return x_new, y_new, [x_min, y_min, x_max, y_max]
 
 
@@ -595,17 +597,19 @@ def apply_lightning_overlay(
     dr, dc = np.meshgrid(offsets, offsets, indexing="ij")
     circle = dr * dr + dc * dc <= radius * radius
 
-    x_min, x_max = x_new[0], x_new[-1]
-    y_min, y_max = y_new[0], y_new[-1]
+    dx = x_new[1] - x_new[0]
+    dy = y_new[1] - y_new[0]
+    x_min = x_new[0] - dx / 2
+    y_min = y_new[0] - dy / 2
 
     thunder_mask = np.zeros((out_h, out_w), dtype=bool)
     hits = 0
     for lat, lon in strikes:
         sx, sy = lonlat_to_webmercator(lon, lat)
-        if not (x_min <= sx <= x_max and y_min <= sy <= y_max):
+        col = int(np.floor((sx - x_min) / dx))
+        row = int(np.floor((sy - y_min) / dy))
+        if not (0 <= col < out_w and 0 <= row < out_h):
             continue
-        col = int(round((sx - x_min) / (x_max - x_min) * (out_w - 1)))
-        row = int(round((sy - y_min) / (y_max - y_min) * (out_h - 1)))
         if not precip_mask[row, col]:
             continue
 
@@ -699,7 +703,7 @@ def write_pixel_bin(
         12  4*f64 extent [xmin, ymin, xmax, ymax] (EPSG:3857)
         44  f64  mm-Quantum
         52  i64  epoch (UTC, Sekunden)
-        56  4x   Padding  -> Header = 64 Byte
+        56  4x   Padding  -> Header = 64 Bytea
         64  int16[w*h]          mm/h   (Zeile 0 = Norden)
         64 + w*h*2  int16[w*h]  Wettercode
 
@@ -707,7 +711,7 @@ def write_pixel_bin(
     hier vertikal gespiegelt (Zeile 0 = Norden)."""
     height, width = code_int.shape
     header = struct.pack(
-        BIN_HEADER_FMT, BIN_MAGIC, width, height, *extent, MM_QUANTUM, int(ts.timestamp())
+        BIN_HEADER_FMT, BIN_MAGIC, width, height, *extent, MM_QUANTUM, int(ts.timestamp()), 1
     )
     assert len(header) == 64, f"Header hat {len(header)} Byte, erwartet 64"
     with open(path, "wb") as f:
