@@ -682,7 +682,7 @@ def make_pixel_arrays(class_merc: np.ndarray, rate_merc: np.ndarray | None) -> t
     if rate_merc is None:
         mm_int = np.full(class_merc.shape, NO_DATA_IN_CHUNK, dtype=np.int16)
     else:
-        has_mm = has_code & ~np.isnan(rate_merc)
+        has_mm = ~np.isnan(rate_merc)
         scaled = np.round(np.nan_to_num(rate_merc, nan=0.0) / MM_QUANTUM)
         mm_int = np.where(has_mm, np.clip(scaled, 0, 32767), NO_DATA_IN_CHUNK).astype(np.int16)
 
