@@ -40,13 +40,14 @@ BIN_HEADER_FMT = "<4sII4ddqB3x"
 
 # Alle Codes, die als echte Daten in die .bin geschrieben werden
 VALID_OUTPUT_CODES = np.array(
-    sorted([4, 5, 8, 9, 10, 11, 12, 31, 32, 33, 61, 62, 71, 72, 73]),
+    sorted([4, 5, 8, 9, 10, 11, 12, 30, 31, 32, 33, 61, 62, 71, 72, 73]),
     dtype=np.int32,
 )
 HAIL_CLASSES = {9, 10}
 
 # SCHWELLWERTE
 RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
+    (0.06, 0.09, 30),          
     (0.1, 1.25, 31),
     (1.25, 10.0, 32),
     (10.0, float("inf"), 33),
@@ -98,7 +99,7 @@ RV_DEFAULT_UNDETECT = 0.0
 RV_STEP_MINUTES = 5.0
 
 PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]
-REFINED_PRECIP_CODES = [31, 32, 33, 61, 62, 71, 72, 73]
+REFINED_PRECIP_CODES = [30, 31, 32, 33, 61, 62, 71, 72, 73]
 ALL_PRECIP_CODES = PRECIP_SOURCE_CODES + REFINED_PRECIP_CODES
 
 
