@@ -119,12 +119,17 @@ jobs:
       - name: Generate WEBP for HymecNG
         run: python scripts/generate_webp.py
 
-      - name: Upload hg_latest.bin to R2 (mit Retry)
+      - name: Upload liveanalyse_latest to R2 (mit Retry)
         run: |
+          # 20261013 + 1005 -> 2026-10-13T10:05:00Z
+          DATA_TIME="${DATE:0:4}-${DATE:4:2}-${DATE:6:2}T${TIME:0:2}:${TIME:2:2}:00Z"
+          echo "data_time = $DATA_TIME"
+
           MAX_ATTEMPTS=3
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
             if aws s3 cp ./output/hymecng/liveanalyse_latest \
                 s3://${{ secrets.R2_BUCKET }}/hymecng/liveanalyse_latest \
+                --metadata "data_time=${DATA_TIME}" \
                 --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
               echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
               exit 0
