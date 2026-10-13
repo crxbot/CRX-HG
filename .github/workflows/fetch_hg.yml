@@ -123,8 +123,8 @@ jobs:
         run: |
           MAX_ATTEMPTS=3
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            if aws s3 cp ./output/hymecng/hg_latest \
-                s3://${{ secrets.R2_BUCKET }}/hymecng/hg_latest \
+            if aws s3 cp ./output/hymecng/liveanalyse_latest \
+                s3://${{ secrets.R2_BUCKET }}/hymecng/liveanalyse_latest \
                 --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
               echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
               exit 0
