@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HymecNG + RV-Hybrid im NATIVEN DWD-Raster (1100 x 1200, stereographisch).
+"""HymecNG + HX-Hybrid im NATIVEN DWD-Raster (1100 x 1200, stereographisch).
 
 Kein Warp nach Web Mercator. Ausgabe: rohe uint8-Bytes, keine Dateiendung.
 Layout: 1200 Zeilen x 1100 Spalten, row-major, Zeile 0 = Norden (wie im HDF5).
@@ -22,13 +22,13 @@ from scipy import ndimage
 # Konfiguration
 # --------------------------------------------------------------------------- #
 SRC_DIR = Path("data/hymecng")
-RV_SRC_DIR = Path("data/rv")
+HX_SRC_DIR = Path("data/hx")
 OUT_DIR = Path("output/hymecng")
 
 FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
 
 # Code-Bedeutung in der Ausgabedatei:
-#   255 = kein Daten / ausserhalb      1 = Regen ohne RV-Wert (unsichtbar)
+#   255 = kein Daten / ausserhalb      1 = Regen ohne HX-Wert (unsichtbar)
 #   30 Niesel, 31 leicht, 32 maessig, 33 stark
 #   4/5 gefrierender Regen             61/62 Schneeregen leicht / maessig+
 #   71/72/73 Schnee leicht/maessig/stark
@@ -37,18 +37,18 @@ FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
 HAIL_CLASSES = {9, 10}
 
 RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 0.1, 30),
+    (0.04, 0.1, 30),
     (0.1, 1.25, 31),
     (1.25, 10.0, 32),
     (10.0, float("inf"), 33),
 ]
 SNOW_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 1.0, 71),
+    (0.04, 1.0, 71),
     (1.0, 4.0, 72),
     (4.0, float("inf"), 73),
 ]
 SLEET_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 1.0, 61),
+    (0.04, 1.0, 61),
     (1.0, float("inf"), 62),
 ]
 
@@ -57,7 +57,7 @@ SLEET_TYPE_CODES = {6, 61, 62}
 FREEZING_RAIN_TYPE_CODES = {4, 5}
 HAIL_TYPE_CODES = {9, 10}
 
-MIN_PRECIP_RATE_MMH = 0.06
+MIN_PRECIP_RATE_MMH = 0.04
 
 NODATA_CLASS = -1
 NODATA_BYTE = 255
@@ -74,11 +74,14 @@ LIGHTNING_PRECIP_MMH_THRESHOLD = 0.1
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
-RV_DEFAULT_GAIN = 0.0009999999317806213
-RV_DEFAULT_OFFSET = -0.0009999999317806213
-RV_DEFAULT_NODATA = 4294967295.0
-RV_DEFAULT_UNDETECT = 0.0
-RV_STEP_MINUTES = 5.0   # ACRR pro 5 min -> mm/h = x * 60 / 5
+# HX (250 m, dBZ) -> mm/h ueber Z-R-Beziehung, danach 4x4-Mittelung auf 1 km
+ZR_A = 256.0            # DWD/RADOLAN: Z = a * R^b
+ZR_B = 1.42
+HX_FACTOR = 4           # 250 m -> 1 km
+HX_MAX_DBZ: float | None = 55.0   # Kappung (Hagel-Kontamination); None = aus
+HX_DEFAULT_GAIN = 0.5            # nur Fallback
+HX_DEFAULT_OFFSET = -32.5        # nur Fallback
+HX_DEFAULT_NODATA = 65535.0
 
 PRECIP_SOURCE_CODES = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 REFINED_PRECIP_CODES = [30, 31, 32, 33, 61, 62, 71, 72, 73]
@@ -97,8 +100,12 @@ def parse_timestamp(filename: str) -> datetime:
     return naive.replace(tzinfo=timezone.utc)
 
 
-def rv_path_for(ts: datetime) -> Path:
-    return RV_SRC_DIR / f"composite_rv_{ts:%Y%m%d}_{ts:%H%M}_000-hd5"
+def hx_path_for(ts: datetime) -> Path:
+    return HX_SRC_DIR / f"composite_hx_{ts:%Y%m%d}_{ts:%H%M}-hd5"
+
+
+def dbz_to_rain(dbz):
+    return (10.0 ** (dbz / 10.0) / ZR_A) ** (1.0 / ZR_B)
 
 
 _DATA_PATH_RE = re.compile(r"(^|/)dataset\d+/data\d+/data$")
@@ -161,11 +168,11 @@ def find_classification_dataset(h5file: h5py.File) -> h5py.Dataset:
     )
 
 
-def find_rate_dataset(h5file: h5py.File) -> h5py.Dataset:
+def find_hx_dataset(h5file: h5py.File) -> h5py.Dataset:
     return _find_2d_dataset_by_quantity(
         h5file,
-        keywords=("RATE", "ACRR"),
-        error_msg="Kein 2D-Datensatz in der RV-Datei gefunden.",
+        keywords=("DBZ", "TH", "REFL"),
+        error_msg="Kein 2D-Datensatz in der HX-Datei gefunden.",
     )
 
 
@@ -243,12 +250,6 @@ def extract_grid_info(where: h5py.Group) -> dict:
     }
 
 
-def grids_identical(a: dict, b: dict, tol: float = 1e-6) -> bool:
-    if a["projdef"] != b["projdef"] or a["xsize"] != b["xsize"] or a["ysize"] != b["ysize"]:
-        return False
-    return all(abs(a[k] - b[k]) <= tol for k in ("xscale", "yscale", "ll_lon", "ll_lat"))
-
-
 # --------------------------------------------------------------------------- #
 # Raster-Geometrie (nativ)
 # --------------------------------------------------------------------------- #
@@ -262,85 +263,69 @@ def lonlat_to_native_rowcol(lon, lat, grid: dict, to_proj: Transformer):
     return row, col
 
 
-def resample_nearest_to_grid(
-    data: np.ndarray,
-    src_grid: dict,
-    dst_grid: dict,
-    fill_value: float,
-) -> np.ndarray:
-    """Falls RV-Raster nicht mit HymecNG-Raster identisch ist: nearest neighbor
-    auf das HymecNG-Raster umsampeln."""
-    to_wgs84_dst = Transformer.from_crs(dst_grid["projdef"], "EPSG:4326", always_xy=True)
-    to_proj_dst = Transformer.from_crs("EPSG:4326", dst_grid["projdef"], always_xy=True)
-    to_proj_src = Transformer.from_crs("EPSG:4326", src_grid["projdef"], always_xy=True)
-
-    ll_x, ll_y = to_proj_dst.transform(dst_grid["ll_lon"], dst_grid["ll_lat"])
-    cols = np.arange(dst_grid["xsize"])
-    rows = np.arange(dst_grid["ysize"])
-    xs = ll_x + (cols + 0.5) * dst_grid["xscale"]
-    ys = ll_y + (dst_grid["ysize"] - 1 - rows + 0.5) * dst_grid["yscale"]
-    xx, yy = np.meshgrid(xs, ys)
-    lon, lat = to_wgs84_dst.transform(xx.ravel(), yy.ravel())
-
-    row_s, col_s = lonlat_to_native_rowcol(lon, lat, src_grid, to_proj_src)
-    row_i = np.floor(row_s + 0.5).astype(np.int64).reshape(xx.shape)
-    col_i = np.floor(col_s + 0.5).astype(np.int64).reshape(xx.shape)
-    valid = (row_i >= 0) & (row_i < src_grid["ysize"]) & (col_i >= 0) & (col_i < src_grid["xsize"])
-
-    out = np.full(xx.shape, fill_value, dtype=np.float64)
-    out[valid] = data[row_i[valid], col_i[valid]]
-    return out
-
-
 # --------------------------------------------------------------------------- #
-# RV laden (nativ)
+# HX laden (250 m, dBZ) -> mm/h auf dem 1-km-Raster
 # --------------------------------------------------------------------------- #
-def load_rv_rate_native(rv_path: Path, class_grid: dict) -> np.ndarray:
-    """RV-Rate in mm/h auf dem HymecNG-Raster. Bei identischem Raster 1:1,
-    sonst nearest-neighbor-Resampling."""
-    with h5py.File(rv_path, "r") as f:
-        ds = find_rate_dataset(f)
+def load_hx_rate_native(hx_path: Path, class_grid: dict) -> np.ndarray:
+    """HX-Reflektivitaet -> Regenrate in mm/h auf dem HymecNG-Raster.
+
+    Reihenfolge: dBZ -> mm/h (pro 250-m-Pixel), dann Mittel ueber 4x4 Pixel.
+    undetect = 0 mm/h (zaehlt im Mittel mit), nodata = NaN (zaehlt nicht mit).
+    """
+    with h5py.File(hx_path, "r") as f:
+        ds = find_hx_dataset(f)
         raw = ds[()]
-        what = ds.parent.get("what")
+        what = None
+        for grp in (ds.parent, ds.parent.parent, ds.file):
+            w_ = grp.get("what")
+            if w_ is not None and "gain" in w_.attrs:
+                what = w_
+                break
         attrs = what.attrs if what is not None else {}
-        quantity = _attr_str(attrs, "quantity").upper()
-        gain = _attr_float(attrs, "gain", RV_DEFAULT_GAIN)
-        offset = _attr_float(attrs, "offset", RV_DEFAULT_OFFSET)
-        nodata = _attr_float(attrs, "nodata", RV_DEFAULT_NODATA)
-        undetect = _attr_float(attrs, "undetect", RV_DEFAULT_UNDETECT)
+        gain = _attr_float(attrs, "gain", HX_DEFAULT_GAIN)
+        offset = _attr_float(attrs, "offset", HX_DEFAULT_OFFSET)
+        nodata = _attr_float(attrs, "nodata", HX_DEFAULT_NODATA)
+        undetect = _attr_float(attrs, "undetect")
 
         where = find_where_group(f)
         if where is None:
-            raise RuntimeError("Keine 'where'-Projektionsinfo in der RV-Datei gefunden.")
-        rv_grid = extract_grid_info(where)
+            raise RuntimeError("Keine 'where'-Projektionsinfo in der HX-Datei gefunden.")
+        hx_grid = extract_grid_info(where)
 
-    rate = raw.astype(np.float64) * gain + offset
+    h, w = raw.shape
+    fct = HX_FACTOR
+    if (w, h) != (class_grid["xsize"] * fct, class_grid["ysize"] * fct):
+        raise RuntimeError(
+            f"HX-Raster {w}x{h} passt nicht zum {fct}x{fct}-Faktor auf "
+            f"{class_grid['xsize']}x{class_grid['ysize']}."
+        )
+    if abs(hx_grid["xscale"] * fct - class_grid["xscale"]) > 1e-6:
+        raise RuntimeError("HX-Pixelgroesse x 4 entspricht nicht der HymecNG-Pixelgroesse.")
+
+    dbz = raw.astype(np.float32) * np.float32(gain) + np.float32(offset)
+    if HX_MAX_DBZ is not None:
+        np.minimum(dbz, np.float32(HX_MAX_DBZ), out=dbz)
+    rate = dbz_to_rain(dbz).astype(np.float32)
     if undetect is not None:
         rate[raw == undetect] = 0.0
     if nodata is not None:
         rate[raw == nodata] = np.nan
+    del dbz
 
-    if "RATE" not in quantity:
-        rate *= 60.0 / RV_STEP_MINUTES
+    blocks = rate.reshape(h // fct, fct, w // fct, fct)
+    valid = np.isfinite(blocks)
+    cnt = valid.sum(axis=(1, 3))
+    total = np.where(valid, blocks, 0.0).sum(axis=(1, 3), dtype=np.float64)
+    out = np.full(cnt.shape, np.nan, dtype=np.float64)
+    ok = cnt > 0
+    out[ok] = total[ok] / cnt[ok]
 
-    print(
-        f"RV-Composite: {rv_path.name} (quantity={quantity or '?'}, "
-        f"Raster {rv_grid['xsize']}x{rv_grid['ysize']})"
-    )
-
-    if grids_identical(class_grid, rv_grid):
-        print("RV-Raster identisch mit HymecNG-Raster -> keine Umrechnung noetig.")
-        return rate
-
-    print(
-        "Warnung: RV- und HymecNG-Raster unterscheiden sich -> nearest-neighbor-Resampling.",
-        file=sys.stderr,
-    )
-    return resample_nearest_to_grid(rate, rv_grid, class_grid, fill_value=np.nan)
+    print(f"HX-Composite: {hx_path.name} ({w}x{h} -> {out.shape[1]}x{out.shape[0]}, mm/h)")
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# HYBRID-STRATEGIE: RV fuer Detektion + Intensitaet, HymecNG fuer Art
+# HYBRID-STRATEGIE: HX fuer Detektion + Intensitaet, HymecNG fuer Art
 # --------------------------------------------------------------------------- #
 def refine_with_hybrid_strategy(
     class_arr: np.ndarray,
@@ -356,7 +341,7 @@ def refine_with_hybrid_strategy(
         refined[mask_snow] = SNOW_MMH_THRESHOLDS[0][2]
         refined[mask_sleet] = SLEET_MMH_THRESHOLDS[0][2]
         if mask_rain.any() or mask_snow.any() or mask_sleet.any():
-            print("Warnung: RV nicht verfuegbar, verwende niedrigste Intensitaetsstufe als Fallback.", file=sys.stderr)
+            print("Warnung: HX nicht verfuegbar, verwende niedrigste Intensitaetsstufe als Fallback.", file=sys.stderr)
         return refined
 
     has_rain = ~np.isnan(rate) & (rate >= MIN_PRECIP_RATE_MMH)
@@ -398,7 +383,7 @@ def refine_with_hybrid_strategy(
     is_preserved_type = np.isin(nearest_type, tuple(FREEZING_RAIN_TYPE_CODES | {8} | HAIL_TYPE_CODES))
     is_rain_type = ~is_snow_type & ~is_sleet_type & ~is_preserved_type
 
-    # Luecken fuellen (RV hat Niederschlag, HymecNG nichts Konkretes)
+    # Luecken fuellen (HX hat Niederschlag, HymecNG nichts Konkretes)
     gap = has_rain & ~np.isin(class_arr, PRECIP_SOURCE_CODES)
 
     for lower, upper, new_code in RAIN_MMH_THRESHOLDS:
@@ -534,18 +519,18 @@ def main() -> None:
 
     to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
 
-    # RV laden (nativ)
+    # Regenrate aus HX laden (nativ, 1 km)
     rate = None
-    rv_path = rv_path_for(ts)
     try:
-        if not rv_path.exists():
-            raise FileNotFoundError(f"{rv_path} nicht gefunden")
-        rate = load_rv_rate_native(rv_path, grid)
+        hx_path = hx_path_for(ts)
+        if not hx_path.exists():
+            raise FileNotFoundError(f"{hx_path} nicht gefunden")
+        rate = load_hx_rate_native(hx_path, grid)
     except (RuntimeError, ValueError, KeyError, OSError) as e:
-        print(f"Warnung: RV-Composite nicht verfuegbar ({e}). Nutze HymecNG-Fallback.", file=sys.stderr)
+        print(f"Warnung: HX nicht verfuegbar ({e}). Nutze HymecNG-Fallback.", file=sys.stderr)
 
     # Hybrid-Verfeinerung
-    print("Wende Hybrid-Strategie an (RV + HymecNG)...")
+    print("Wende Hybrid-Strategie an (HX + HymecNG)...")
     class_arr = refine_with_hybrid_strategy(class_arr, rate)
 
     # uint8
