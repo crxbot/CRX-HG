@@ -75,8 +75,8 @@ LIGHTNING_PRECIP_MMH_THRESHOLD = 0.1
 BERLIN = ZoneInfo("Europe/Berlin")
 
 # HX (250 m, dBZ) -> mm/h ueber Z-R-Beziehung, danach 4x4-Mittelung auf 1 km
-ZR_A = 256.0            # DWD/RADOLAN: Z = a * R^b
-ZR_B = 1.42
+ZR_A = 200.0            # DWD/RADOLAN: Z = a * R^b
+ZR_B = 1.6
 HX_FACTOR = 4           # 250 m -> 1 km
 HX_MAX_DBZ: float | None = 55.0   # Kappung (Hagel-Kontamination); None = aus
 HX_DEFAULT_GAIN = 0.5            # nur Fallback
