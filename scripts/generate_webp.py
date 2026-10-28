@@ -37,18 +37,18 @@ FILENAME_RE = re.compile(r"composite_HymecNG_(\d{8})_(\d{4})_(\d{3})-hd5")
 HAIL_CLASSES = {9, 10}
 
 RAIN_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 0.1, 30),
+    (0.08, 0.1, 30),
     (0.1, 1.25, 31),
     (1.25, 10.0, 32),
     (10.0, float("inf"), 33),
 ]
 SNOW_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 1.0, 71),
+    (0.08, 1.0, 71),
     (1.0, 4.0, 72),
     (4.0, float("inf"), 73),
 ]
 SLEET_MMH_THRESHOLDS: list[tuple[float, float, int]] = [
-    (0.06, 1.0, 61),
+    (0.08, 1.0, 61),
     (1.0, float("inf"), 62),
 ]
 
